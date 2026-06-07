@@ -2,6 +2,8 @@
 
 ## Project Overview
 
+This is a single-developer project. There is no CI, no multi-contributor workflow, and no need for automated guardrails that exist only to protect a team. Keep tooling minimal.
+
 This project is a Python coding challenge for a conversational Cal.com scheduling assistant. The application should let a user manage their Cal.com calendar through natural language in an interactive web chat UI.
 
 The minimum working prototype supports:
@@ -102,7 +104,7 @@ Use environment variables for credentials and local configuration.
 
 ```text
 CAL_API_KEY=
-CAL_API_BASE_URL=https://api.cal.com/v1
+CAL_API_BASE_URL=https://api.cal.com/v2
 CAL_EVENT_TYPE_ID=
 CAL_USERNAME=
 CAL_TIMEZONE=America/New_York
