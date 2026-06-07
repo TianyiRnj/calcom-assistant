@@ -15,11 +15,15 @@ from schemas import (
     Attendee,
     Booking,
     BookingDraft,
+    BookingRequest,
     CalClientError,
+    CancelRequest,
     EventType,
     IntentType,
     IntentValidationError,
     PendingAction,
+    RescheduleRequest,
+    Slot,
     UserIntent,
 )
 
@@ -550,3 +554,84 @@ class TestTimePreferenceHandling:
             reply = handle_message("Move my Intro Call to later today", state, cal)
         cal.find_slots.assert_not_called()
         assert any(word in reply.lower() for word in ("specific", "date", "time", "day", "when", "reschedule"))
+
+
+# ===========================================================================
+# TestConfirmationErrorHandling
+# ===========================================================================
+
+
+class TestConfirmationErrorHandling:
+    def _booking_confirmation_state(self) -> dict:
+        request = BookingRequest(
+            attendee_name="Taylor",
+            attendee_email="taylor@example.com",
+            start_time=_T0,
+            duration_minutes=30,
+            timezone="UTC",
+            event_type_id=42,
+        )
+        pending = PendingAction(
+            action_type="book",
+            booking_request=request,
+            selected_slot=Slot(start=_T0, end=_T1),
+        )
+        return {"messages": [], "pending_action": pending, "available_slots": []}
+
+    def _cal(self) -> MagicMock:
+        return MagicMock(spec=CalClient)
+
+    def test_timeout_clears_booking_request(self) -> None:
+        state = self._booking_confirmation_state()
+        cal = self._cal()
+        cal.create_booking.side_effect = CalClientError("timeout", None, reason="timeout")
+        reply = handle_message("yes", state, cal)
+        assert state["pending_action"].booking_request is None
+        assert "timed out" in reply.lower()
+
+    def test_network_error_clears_booking_request(self) -> None:
+        state = self._booking_confirmation_state()
+        cal = self._cal()
+        cal.create_booking.side_effect = CalClientError("network", None, reason="network")
+        reply = handle_message("yes", state, cal)
+        assert state["pending_action"].booking_request is None
+        assert "timed out" in reply.lower()
+
+    def test_400_already_booked_clears_request_and_explains(self) -> None:
+        state = self._booking_confirmation_state()
+        cal = self._cal()
+        cal.create_booking.side_effect = CalClientError(
+            "User either already has booking at this time or is not available", 400
+        )
+        reply = handle_message("yes", state, cal)
+        assert state["pending_action"].booking_request is None
+        assert "already taken" in reply.lower() or "unavailable" in reply.lower()
+
+    def test_generic_400_clears_request(self) -> None:
+        state = self._booking_confirmation_state()
+        cal = self._cal()
+        cal.create_booking.side_effect = CalClientError("Bad request", 400)
+        reply = handle_message("yes", state, cal)
+        assert state["pending_action"].booking_request is None
+
+    def test_clear_pending_request_helper_clears_all_fields(self) -> None:
+        from assistant import _clear_pending_request
+        pending = PendingAction(
+            action_type="book",
+            booking_request=BookingRequest(
+                attendee_name="Jane",
+                attendee_email="jane@example.com",
+                start_time=_T0,
+                duration_minutes=30,
+                timezone="UTC",
+                event_type_id=42,
+            ),
+            cancel_request=CancelRequest(booking_uid="uid-1"),
+            reschedule_request=RescheduleRequest(booking_uid="uid-2", new_start_time=_T1),
+        )
+        state: dict = {"pending_action": pending}
+        _clear_pending_request(pending, state)
+        assert pending.booking_request is None
+        assert pending.cancel_request is None
+        assert pending.reschedule_request is None
+        assert state["pending_action"] is pending

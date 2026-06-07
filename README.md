@@ -63,6 +63,20 @@ python -m streamlit run app.py
 
 The chat interface opens at `http://localhost:8501`.
 
+## Cache and shortcuts
+
+The app caches the Cal.com client while Streamlit is running. Restart Streamlit
+after changing credentials or calendar configuration.
+
+Keep copy on the standard `Ctrl+C` / `Cmd+C` shortcut. Do not bind clear cache
+to that shortcut. If a keyboard shortcut is added for clear cache later, use
+`Ctrl+Shift+K` on Windows/Linux and `Cmd+Shift+K` on macOS, and ignore the
+shortcut while the user is typing in an input or editable field.
+
+Streamlit's file-change and rerun controls remain available when needed. The
+persistent top-right `Deploy` button is hidden, while the three-dot menu remains
+available. The app labels rerun as `Ctrl+R` and clear cache away from bare `C`.
+
 ## Demo prompts
 
 Once the app is running, try these in the chat:

@@ -5,6 +5,7 @@ __pycache__/
 
 # Test and coverage output
 .pytest_cache/
+.playwright-cli/
 .coverage
 coverage.xml
 htmlcov/

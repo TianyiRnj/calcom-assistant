@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from enum import Enum
 from typing import Optional
@@ -138,6 +139,7 @@ class BookingRequest(BaseModel):
     timezone: str
     event_type_id: int
     include_length_in_minutes: bool = False
+    idempotency_key: str = Field(default_factory=lambda: str(uuid.uuid4()))
 
     @field_validator("start_time", mode="after")
     @classmethod

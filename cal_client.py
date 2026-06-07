@@ -84,6 +84,7 @@ class CalClient:
         self._client = _client or httpx.Client(
             base_url=base_url,
             headers={"Authorization": f"Bearer {api_key}"},
+            timeout=httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0),
         )
 
     # ------------------------------------------------------------------
@@ -194,6 +195,7 @@ class CalClient:
                 "email": request.attendee_email,
                 "timeZone": request.timezone,
             },
+            "metadata": {"externalRef": request.idempotency_key},
         }
         if getattr(request, "include_length_in_minutes", False):
             body["lengthInMinutes"] = request.duration_minutes

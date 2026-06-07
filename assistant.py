@@ -27,6 +27,13 @@ from schemas import (
 _AFFIRMATIVES = {"yes", "y", "confirm", "sure", "ok", "okay", "yep", "yeah", "do it"}
 _NEGATIVES = {"no", "n", "nope", "nah", "never mind", "nevermind", "don't", "dont"}
 
+
+def _fmt_dt(dt: datetime, at: bool = False) -> str:
+    sep = " at" if at else ","
+    time = dt.strftime("%I:%M %p").lstrip("0")
+    return f"{dt.strftime('%b')} {dt.day}{sep} {time}"
+
+
 _INTENT_PROMPT_BASE = """\
 Extract the scheduling intent from the user's message and return JSON only.
 
@@ -37,11 +44,15 @@ Required field: intent_type — one of: list, book, cancel, reschedule, unknown.
 Optional fields:
 - search_text: relevant names/keywords
 - attendee_name: person's name
-- attendee_email: email address
+- attendee_email: the exact string the user gave as the attendee email — extract it \
+as-is even if it does not look like a valid email address (e.g. "not-an-email" or \
+"test" are still extracted; validation happens elsewhere)
 - duration_minutes: integer
-- start_time: ISO 8601 with timezone offset — resolve relative expressions like \
-"Thursday afternoon", "later today", "next week" to concrete datetimes using the \
-current date above. Set to null if the expression genuinely cannot be resolved.
+- start_time: ISO 8601 with timezone offset. Resolve ALL explicit date/time expressions \
+to concrete datetimes using the current date above — including past times like \
+"yesterday at 2pm" or "last Monday" (the application validates whether the time is in \
+the past; do not suppress it). Only set null when no specific day or time is mentioned \
+at all (e.g. "book a call with Jane" with zero time information).
 - end_time: ISO 8601 with timezone offset — search window end. If you set start_time, \
 also derive end_time based on the time-of-day preference (morning=08:00-12:00, \
 afternoon=12:00-17:00, evening=17:00-21:00, exact time=start+duration or +30min).
@@ -268,11 +279,11 @@ def _handle_list(
     bookings = cal_client.list_bookings(start=intent.start_time, end=intent.end_time)
     if not bookings:
         return "You have nothing scheduled for that period."
-    lines = ["Here's what's coming up:"]
+    items = []
     for b in bookings:
         tz_label = b.start.strftime("%Z") or ""
-        lines.append(f"• {b.title} — {b.start.strftime('%b %-d, %I:%M %p')} {tz_label}".strip())
-    return "\n".join(lines)
+        items.append(f"- {b.title} — {_fmt_dt(b.start)} {tz_label}".strip())
+    return "Here's what's coming up:\n\n" + "\n".join(items)
 
 
 def _handle_book(
@@ -306,6 +317,7 @@ def _handle_book(
     if draft.start_time is not None:
         now = datetime.now(tz=draft.start_time.tzinfo)
         if draft.start_time < now:
+            draft.start_time = None  # clear so next message doesn't re-trigger this
             raise IntentValidationError(
                 "Requested time is in the past", reason="past_date"
             )
@@ -330,22 +342,6 @@ def _handle_book(
 def _handle_cancel(
     intent: UserIntent, session_state: dict, cal_client: CalClient
 ) -> str:
-    pending: Optional[PendingAction] = session_state.get("pending_action")
-
-    # User is picking from previously listed matches
-    if (
-        pending is not None
-        and pending.action_type == "cancel"
-        and pending.matching_bookings
-    ):
-        selected = _pick_booking(intent, pending.matching_bookings, user_text=None)
-        if selected:
-            pending.cancel_request = CancelRequest(booking_uid=selected.uid)
-            pending.matching_bookings = []
-            session_state["pending_action"] = pending
-            return _cancel_confirmation_text(selected)
-
-    # Search upcoming bookings first
     upcoming = cal_client.list_bookings(status="upcoming")
     matches = _filter_bookings(upcoming, intent)
 
@@ -374,22 +370,10 @@ def _handle_reschedule(
     intent: UserIntent, session_state: dict, cal_client: CalClient
 ) -> str:
     pending: Optional[PendingAction] = session_state.get("pending_action")
-    available_slots: list[Slot] = session_state.get("available_slots", [])
-
-    # User is picking from previously listed matches
-    if (
-        pending is not None
-        and pending.action_type == "reschedule"
-        and pending.matching_bookings
-    ):
-        selected = _pick_booking(intent, pending.matching_bookings, user_text=None)
-        if selected:
-            pending.matching_bookings = []
-            session_state["pending_action"] = pending
-            return _fetch_reschedule_slots(selected, intent, session_state, cal_client)
 
     # Continue a reschedule after "no slots" — bypass full search when uid is known
     stored_uid = session_state.get("_reschedule_booking_uid")
+    upcoming: Optional[list[Booking]] = None
     if (
         stored_uid
         and pending is not None
@@ -402,8 +386,8 @@ def _handle_reschedule(
         if uid_match:
             return _fetch_reschedule_slots(uid_match, intent, session_state, cal_client)
 
-    # Search upcoming bookings first
-    upcoming = cal_client.list_bookings(status="upcoming")
+    if upcoming is None:
+        upcoming = cal_client.list_bookings(status="upcoming")
     matches = _filter_bookings(upcoming, intent)
 
     if not matches:
@@ -428,12 +412,21 @@ def _handle_reschedule(
 # ---------------------------------------------------------------------------
 
 
-def _in_confirmation_phase(pending: PendingAction) -> bool:
+def _in_confirmation_phase(pending: Optional[PendingAction]) -> bool:
+    if pending is None:
+        return False
     return (
         pending.booking_request is not None
         or pending.cancel_request is not None
         or pending.reschedule_request is not None
     )
+
+
+def _clear_pending_request(pending: PendingAction, session_state: dict) -> None:
+    pending.booking_request = None
+    pending.cancel_request = None
+    pending.reschedule_request = None
+    session_state["pending_action"] = pending
 
 
 def _handle_confirmation(
@@ -448,18 +441,29 @@ def _handle_confirmation(
         except CalClientError as exc:
             if exc.status_code is None:
                 if exc.reason in ("timeout", "network"):
-                    return "Cal.com timed out or could not be reached. Please try again."
-                if exc.reason == "malformed":
-                    return "Cal.com returned an unexpected response. Please try again."
-                if exc.reason == "slot_unavailable" and pending.booking_request is not None:
-                    session_state["available_slots"] = []
-                    pending.booking_request = None
-                    session_state["pending_action"] = pending
+                    _clear_pending_request(pending, session_state)
                     return (
-                        "That slot is no longer available. "
-                        "Please choose another time."
+                        "Cal.com timed out. The action may or may not have gone through — "
+                        "please check your calendar before trying again."
                     )
+                if exc.reason == "malformed":
+                    _clear_pending_request(pending, session_state)
+                    return "Cal.com returned an unexpected response. Please check your calendar."
+                if exc.reason == "slot_unavailable":
+                    session_state["available_slots"] = []
+                    _clear_pending_request(pending, session_state)
+                    return "That slot is no longer available. Please choose another time."
+                _clear_pending_request(pending, session_state)
                 return "Something went wrong with Cal.com. Please try again."
+            # HTTP error (4xx / 5xx): clear pending so the Confirm button disappears
+            _clear_pending_request(pending, session_state)
+            if exc.status_code == 400:
+                msg = exc.message.lower()
+                if "already has booking" in msg or "not available" in msg:
+                    return (
+                        "That slot is already taken or the host is unavailable. "
+                        "Please choose a different time."
+                    )
             return _format_cal_error(exc)
     elif _is_negative(user_text) or _is_cancel_word(user_text):
         session_state["pending_action"] = None
@@ -478,7 +482,7 @@ def _execute_confirmed_action(
         tz = booking.start.strftime("%Z") or ""
         return (
             f"Done! '{booking.title}' is booked for "
-            f"{booking.start.strftime('%b %-d, %I:%M %p')} {tz}."
+            f"{_fmt_dt(booking.start)} {tz}."
         ).strip()
 
     if pending.cancel_request is not None:
@@ -496,7 +500,7 @@ def _execute_confirmed_action(
         tz = booking.start.strftime("%Z") or ""
         return (
             f"Rescheduled! '{booking.title}' is now at "
-            f"{booking.start.strftime('%b %-d, %I:%M %p')} {tz}."
+            f"{_fmt_dt(booking.start)} {tz}."
         ).strip()
 
     return "Nothing to confirm."
@@ -526,7 +530,7 @@ def _handle_slot_selection(
 ) -> str:
     slot = _pick_slot(user_text, available_slots)
     if slot is None:
-        return _format_slot_list(available_slots) + "\n\nWhich slot works for you?"
+        return "Please reply with a number between 1 and 5 to select a slot."
 
     draft = pending.booking_draft
     if draft is None or draft.event_type_id is None:
@@ -549,7 +553,7 @@ def _handle_slot_selection(
     tz = slot.start.strftime("%Z") or ""
     return (
         f"Book with {request.attendee_name} on "
-        f"{slot.start.strftime('%b %-d at %I:%M %p')} {tz}? "
+        f"{_fmt_dt(slot.start, at=True)} {tz}? "
         "Say yes or no."
     ).strip()
 
@@ -733,8 +737,8 @@ def _fetch_and_show_slots(
     if not slots:
         return "No available slots in that window. What other time works for you?"
 
-    session_state["available_slots"] = slots
-    return _format_slot_list(slots) + "\n\nWhich slot works for you?"
+    session_state["available_slots"] = slots[:5]
+    return "Here are some available slots — pick one above or reply with a number."
 
 
 def _fetch_reschedule_slots(
@@ -787,9 +791,9 @@ def _fetch_reschedule_slots(
     )
     session_state["pending_action"] = pending
     session_state["_reschedule_booking_uid"] = booking.uid
-    session_state["available_slots"] = slots
+    session_state["available_slots"] = slots[:5]
 
-    return _format_slot_list(slots) + "\n\nWhich slot works for you?"
+    return "Here are some available slots — pick one above or reply with a number."
 
 
 def _handle_slot_selection_for_reschedule(
@@ -799,7 +803,7 @@ def _handle_slot_selection_for_reschedule(
 ) -> str:
     slot = _pick_slot(user_text, slots)
     if slot is None:
-        return _format_slot_list(slots) + "\n\nWhich slot works for you?"
+        return "Please reply with a number between 1 and 5 to select a slot."
 
     booking_uid = session_state.get("_reschedule_booking_uid", "")
     pending = session_state.get("pending_action")
@@ -815,7 +819,7 @@ def _handle_slot_selection_for_reschedule(
 
     tz = slot.start.strftime("%Z") or ""
     return (
-        f"Reschedule to {slot.start.strftime('%b %-d at %I:%M %p')} {tz}? "
+        f"Reschedule to {_fmt_dt(slot.start, at=True)} {tz}? "
         "Say yes or no."
     ).strip()
 
@@ -891,37 +895,21 @@ def _filter_bookings(bookings: list[Booking], intent: UserIntent) -> list[Bookin
     return results
 
 
-def _pick_booking(
-    intent: UserIntent, bookings: list[Booking], user_text: Optional[str]
-) -> Optional[Booking]:
-    if intent.booking_uid:
-        for b in bookings:
-            if b.uid == intent.booking_uid:
-                return b
-    if user_text:
-        text = user_text.lower()
-        m = re.search(r"\b([1-9])\b", text)
-        if m:
-            idx = int(m.group(1)) - 1
-            if 0 <= idx < len(bookings):
-                return bookings[idx]
-    return None
-
 
 def _merge_intent_into_draft(draft: BookingDraft, intent: UserIntent) -> None:
-    if intent.attendee_name:
+    if intent.attendee_name is not None:
         draft.attendee_name = intent.attendee_name
-    if intent.attendee_email:
+    if intent.attendee_email is not None:
         draft.attendee_email = intent.attendee_email
-    if intent.duration_minutes:
+    if intent.duration_minutes is not None:
         draft.duration_minutes = intent.duration_minutes
-    if intent.start_time:
+    if intent.start_time is not None:
         draft.start_time = intent.start_time
-    if intent.end_time:
+    if intent.end_time is not None:
         draft.end_time = intent.end_time
-    if intent.timezone:
+    if intent.timezone is not None:
         draft.timezone = intent.timezone
-    if intent.time_preference:
+    if intent.time_preference is not None:
         draft.time_preference = intent.time_preference
 
 
@@ -939,19 +927,11 @@ def _ask_for_field(field: str) -> str:
     return prompts.get(field, f"What's the {field.replace('_', ' ')}?")
 
 
-def _format_slot_list(slots: list[Slot]) -> str:
-    lines = ["Here are the available slots:"]
-    for i, slot in enumerate(slots[:5], 1):
-        tz = slot.start.strftime("%Z") or ""
-        lines.append(f"{i}. {slot.start.strftime('%b %-d, %I:%M %p')} {tz}".strip())
-    return "\n".join(lines)
-
-
 def _cancel_confirmation_text(booking: Booking) -> str:
     tz = booking.start.strftime("%Z") or ""
     return (
         f"Cancel '{booking.title}' on "
-        f"{booking.start.strftime('%b %-d at %I:%M %p')} {tz}? "
+        f"{_fmt_dt(booking.start, at=True)} {tz}? "
         "Say yes or no."
     ).strip()
 
@@ -960,7 +940,7 @@ def _multiple_matches_text(bookings: list[Booking], action: str) -> str:
     lines = [f"I found {len(bookings)} matching bookings. Which one do you mean?"]
     for i, b in enumerate(bookings, 1):
         tz = b.start.strftime("%Z") or ""
-        lines.append(f"{i}. {b.title} — {b.start.strftime('%b %-d, %I:%M %p')} {tz}".strip())
+        lines.append(f"{i}. {b.title} — {_fmt_dt(b.start)} {tz}".strip())
     return "\n".join(lines)
 
 
