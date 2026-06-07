@@ -7,8 +7,8 @@ from unittest.mock import MagicMock, call, patch
 import httpx
 import pytest
 
-from cal_client import CalClient
-from schemas import AssistantError, Booking, BookingRequest, CalClientError, Slot
+from cal_client import CalClient, build_from_env
+from schemas import AssistantError, Booking, BookingRequest, CalClientError, EventType, Slot
 
 from tests.conftest import booking_dict, make_response
 
@@ -77,6 +77,55 @@ class TestListBookings:
 
 
 # ===========================================================================
+# TestListEventTypes
+# ===========================================================================
+
+
+class TestListEventTypes:
+    def test_list_event_types_uses_username_and_api_version(
+        self, cal_client: CalClient, mock_http: MagicMock
+    ) -> None:
+        mock_http.get.return_value = make_response(
+            200,
+            {
+                "status": "success",
+                "data": [
+                    {
+                        "id": 42,
+                        "title": "30 min meeting",
+                        "slug": "30min",
+                        "lengthInMinutes": 30,
+                    }
+                ],
+            },
+        )
+
+        event_types = cal_client.list_event_types()
+
+        assert isinstance(event_types[0], EventType)
+        assert event_types[0].id == 42
+        _, kwargs = mock_http.get.call_args
+        assert kwargs["headers"]["cal-api-version"] == "2024-06-14"
+        assert kwargs["params"]["username"] == "testuser"
+
+
+# ===========================================================================
+# TestBuildFromEnv
+# ===========================================================================
+
+
+class TestBuildFromEnv:
+    def test_invalid_legacy_event_type_id_is_ignored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CAL_EVENT_TYPE_ID", "https://cal.com/user/30min")
+
+        client = build_from_env()
+
+        assert client.event_type_id is None
+
+
+# ===========================================================================
 # TestFindSlots
 # ===========================================================================
 
@@ -130,6 +179,14 @@ class TestFindSlots:
         cal_client.find_slots(_T0, _T1, duration_minutes=30)
         _, kwargs = mock_http.get.call_args
         assert kwargs["params"]["duration"] == 30
+
+    def test_find_slots_can_override_default_event_type_id(
+        self, cal_client: CalClient, mock_http: MagicMock
+    ) -> None:
+        mock_http.get.return_value = make_response(200, self._slot_response())
+        cal_client.find_slots(_T0, _T1, event_type_id=99)
+        _, kwargs = mock_http.get.call_args
+        assert kwargs["params"]["eventTypeId"] == 99
 
     def test_find_slots_sends_booking_uid_to_reschedule_when_provided(
         self, cal_client: CalClient, mock_http: MagicMock
@@ -233,11 +290,21 @@ class TestCreateBooking:
         assert body["attendee"]["name"] == "Jane"
         assert body["attendee"]["email"] == "jane@example.com"
 
-    def test_create_booking_sends_length_in_minutes(
+    def test_create_booking_omits_length_in_minutes_by_default(
         self, cal_client: CalClient, mock_http: MagicMock
     ) -> None:
         mock_http.post.return_value = make_response(200, {"status": "success", "data": booking_dict()})
         cal_client.create_booking(self._request())
+        _, kwargs = mock_http.post.call_args
+        assert "lengthInMinutes" not in kwargs["json"]
+
+    def test_create_booking_sends_length_in_minutes_when_requested(
+        self, cal_client: CalClient, mock_http: MagicMock
+    ) -> None:
+        mock_http.post.return_value = make_response(200, {"status": "success", "data": booking_dict()})
+        request = self._request()
+        request.include_length_in_minutes = True
+        cal_client.create_booking(request)
         _, kwargs = mock_http.post.call_args
         assert kwargs["json"]["lengthInMinutes"] == 30
 
@@ -418,6 +485,27 @@ class TestStatusErrorHandling:
         )
         with pytest.raises(CalClientError):
             cal_client.create_booking(request)
+
+    def test_create_booking_http_400_preserves_response_message(
+        self, cal_client: CalClient, mock_http: MagicMock
+    ) -> None:
+        mock_http.post.return_value = make_response(
+            400, {"error": {"message": "Email verification code is required"}}
+        )
+        request = BookingRequest(
+            attendee_name="Jane",
+            attendee_email="jane@example.com",
+            start_time=_T0,
+            duration_minutes=30,
+            timezone="America/New_York",
+            event_type_id=42,
+        )
+
+        with pytest.raises(CalClientError) as exc_info:
+            cal_client.create_booking(request)
+
+        assert exc_info.value.status_code == 400
+        assert "Email verification code is required" in exc_info.value.message
 
     def test_find_slots_status_not_found_raises_cal_client_error(
         self, cal_client: CalClient, mock_http: MagicMock

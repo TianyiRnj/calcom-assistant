@@ -16,6 +16,7 @@ from schemas import (
     BookingRequest,
     CalClientError,
     CancelRequest,
+    EventType,
     IntentType,
     IntentValidationError,
     PendingAction,
@@ -38,6 +39,7 @@ def _sample_booking(**kwargs) -> Booking:
         end=_T1,
         attendees=[Attendee(name="Jane", email="jane@example.com")],
         status="accepted",
+        event_type_id=42,
     )
     defaults.update(kwargs)
     return Booking(**defaults)
@@ -51,6 +53,10 @@ def _mock_cal(**overrides) -> MagicMock:
     cal = MagicMock(spec=CalClient)
     cal.list_bookings.return_value = []
     cal.find_slots.return_value = []
+    cal.list_event_types.return_value = [
+        EventType(id=41, title="15 min meeting", slug="15min", lengthInMinutes=15),
+        EventType(id=42, title="30 min meeting", slug="30min", lengthInMinutes=30),
+    ]
     cal.create_booking.return_value = _sample_booking()
     cal.cancel_booking.return_value = None
     cal.reschedule_booking.return_value = _sample_booking(start=_T2, end=_T3)
@@ -942,6 +948,17 @@ class TestErrorClassification:
         cal.create_booking.side_effect = CalClientError("bad json", None, reason="malformed")
         reply = handle_message("yes", self._booking_pending_state(), cal)
         assert "unexpected" in reply.lower() or "response" in reply.lower()
+        assert "confirmed" not in reply.lower()
+
+    def test_booking_confirmation_http_400_shows_rejected_request(self) -> None:
+        cal = _mock_cal()
+        cal.create_booking.side_effect = CalClientError(
+            "Email verification code is required", 400
+        )
+        reply = handle_message("yes", self._booking_pending_state(), cal)
+
+        assert "rejected" in reply.lower()
+        assert "Email verification code is required" in reply
         assert "confirmed" not in reply.lower()
 
     def test_booking_slot_unavailable_asks_to_choose_again(self) -> None:

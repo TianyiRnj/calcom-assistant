@@ -20,11 +20,10 @@ from schemas import Attendee, Booking, Slot
 def mock_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CAL_API_KEY", "test-cal-key")
     monkeypatch.setenv("CAL_API_BASE_URL", "https://api.cal.com/v2")
-    monkeypatch.setenv("CAL_EVENT_TYPE_ID", "42")
     monkeypatch.setenv("CAL_USERNAME", "testuser")
     monkeypatch.setenv("CAL_TIMEZONE", "America/New_York")
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
-    monkeypatch.setenv("LLM_MODEL", "gpt-5.4-nano")
+    monkeypatch.setenv("LLM_MODEL", "test-openai-model")
 
 
 # ---------------------------------------------------------------------------
@@ -127,5 +126,6 @@ def booking_dict(
         "start": _T0.isoformat(),
         "end": _T1.isoformat(),
         "status": status,
+        "eventTypeId": 42,
         "attendees": [{"name": "Jane", "email": "jane@example.com"}],
     }

@@ -6,8 +6,9 @@ from typing import Optional
 
 import httpx
 
-from schemas import Booking, BookingRequest, CalClientError, Slot
+from schemas import Booking, BookingRequest, CalClientError, EventType, Slot
 
+_VERSION_EVENT_TYPES = "2024-06-14"
 _VERSION_BOOKINGS_READ = "2026-05-01"
 _VERSION_BOOKINGS_WRITE = "2026-02-25"
 _VERSION_SLOTS = "2024-09-04"
@@ -15,6 +16,41 @@ _VERSION_SLOTS = "2024-09-04"
 _PAGE_LIMIT = 20
 
 _SLOT_UNAVAILABLE_HINTS = ("slot", "unavailable", "no longer", "already booked")
+
+
+def _message_from_error_value(value) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("message", "error", "details"):
+            message = _message_from_error_value(value.get(key))
+            if message:
+                return message
+        for nested in value.values():
+            message = _message_from_error_value(nested)
+            if message:
+                return message
+    if isinstance(value, list):
+        parts = [_message_from_error_value(item) for item in value]
+        return "; ".join(part for part in parts if part)
+    return ""
+
+
+def _response_error_message(response: httpx.Response) -> str:
+    fallback = f"Cal.com API error: {response.status_code}"
+    try:
+        data = response.json()
+    except Exception:
+        return fallback
+
+    if not isinstance(data, dict):
+        return fallback
+
+    for key in ("message", "error", "details"):
+        message = _message_from_error_value(data.get(key))
+        if message:
+            return message
+    return fallback
 
 
 def _to_utc_iso(dt: datetime) -> str:
@@ -35,9 +71,9 @@ class CalClient:
         self,
         api_key: str,
         base_url: str,
-        event_type_id: int,
-        username: str,
-        timezone: str,
+        event_type_id: Optional[int] = None,
+        username: str = "",
+        timezone: str = "America/New_York",
         _client: Optional[httpx.Client] = None,
     ) -> None:
         self.api_key = api_key
@@ -92,6 +128,15 @@ class CalClient:
 
         return all_bookings
 
+    def list_event_types(self) -> list[EventType]:
+        params: dict = {"username": self.username, "sortCreatedAt": "desc"}
+        return self._get(
+            "/event-types",
+            params=params,
+            version=_VERSION_EVENT_TYPES,
+            parse=lambda data: [EventType(**e) for e in data.get("data", [])],
+        )
+
     def find_slots(
         self,
         start: datetime,
@@ -99,10 +144,18 @@ class CalClient:
         duration_minutes: Optional[int] = None,
         timezone: Optional[str] = None,
         booking_uid_to_reschedule: Optional[str] = None,
+        event_type_id: Optional[int] = None,
     ) -> list[Slot]:
         tz = timezone or self.timezone
+        selected_event_type_id = event_type_id or self.event_type_id
+        if selected_event_type_id is None:
+            raise CalClientError(
+                "No Cal.com event type selected for slot lookup.",
+                None,
+                reason="missing_event_type",
+            )
         params: dict = {
-            "eventTypeId": self.event_type_id,
+            "eventTypeId": selected_event_type_id,
             "start": _to_utc_iso(start),
             "end": _to_utc_iso(end),
             "timeZone": tz,
@@ -136,13 +189,14 @@ class CalClient:
         body = {
             "eventTypeId": request.event_type_id,
             "start": _to_utc_iso(request.start_time),
-            "lengthInMinutes": request.duration_minutes,
             "attendee": {
                 "name": request.attendee_name,
                 "email": request.attendee_email,
                 "timeZone": request.timezone,
             },
         }
+        if getattr(request, "include_length_in_minutes", False):
+            body["lengthInMinutes"] = request.duration_minutes
         return self._post(
             "/bookings",
             body=body,
@@ -239,16 +293,26 @@ class CalClient:
                 "Cal.com rate limit reached. Please try again shortly.", 429
             )
         if not response.is_success:
+            message = _response_error_message(response)
+            reason = (
+                "slot_unavailable"
+                if any(h in message.lower() for h in _SLOT_UNAVAILABLE_HINTS)
+                else ""
+            )
             raise CalClientError(
-                f"Cal.com API error: {response.status_code}", response.status_code
+                message,
+                response.status_code,
+                reason=reason,
             )
 
 
 def build_from_env() -> CalClient:
+    event_type_id_raw = os.environ.get("CAL_EVENT_TYPE_ID", "").strip()
+    event_type_id = int(event_type_id_raw) if event_type_id_raw.isdigit() else None
     return CalClient(
         api_key=os.environ["CAL_API_KEY"],
         base_url=os.environ.get("CAL_API_BASE_URL", "https://api.cal.com/v2"),
-        event_type_id=int(os.environ["CAL_EVENT_TYPE_ID"]),
+        event_type_id=event_type_id,
         username=os.environ["CAL_USERNAME"],
         timezone=os.environ.get("CAL_TIMEZONE", "America/New_York"),
     )

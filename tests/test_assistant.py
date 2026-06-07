@@ -16,6 +16,7 @@ from schemas import (
     Booking,
     BookingDraft,
     CalClientError,
+    EventType,
     IntentType,
     IntentValidationError,
     PendingAction,
@@ -78,6 +79,16 @@ class TestIntentExtraction:
             intent = extract_intent("Send Jane the notes", [])
         assert intent.intent_type == IntentType.unknown
 
+    def test_json_format_hint_is_in_input_messages(self) -> None:
+        resp = openai_response("list")
+        create = MagicMock(return_value=resp)
+        mock_client = MagicMock(responses=MagicMock(create=create))
+        with patch("assistant._create_openai_client", return_value=mock_client):
+            extract_intent("What's on my calendar tomorrow?", [])
+
+        input_messages = create.call_args.kwargs["input"]
+        assert any("json" in message["content"].lower() for message in input_messages)
+
 
 # ===========================================================================
 # TestAssistantErrors — LLM/JSON failures
@@ -91,6 +102,16 @@ class TestAssistantErrors:
             with pytest.raises(AssistantError) as exc_info:
                 extract_intent("Book something", [])
         assert exc_info.value.reason == "llm_failure"
+
+    def test_missing_llm_model_raises_assistant_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LLM_MODEL", "")
+        with pytest.raises(AssistantError) as exc_info:
+            extract_intent("Book something", [])
+
+        assert exc_info.value.reason == "llm_failure"
+        assert "LLM_MODEL" in exc_info.value.message
 
     def test_bad_json_raises_assistant_error_reason_bad_json(self) -> None:
         bad_msg = MagicMock()
@@ -213,6 +234,10 @@ class TestMissingFields:
     def _cal(self) -> MagicMock:
         m = MagicMock(spec=CalClient)
         m.find_slots.return_value = []
+        m.list_event_types.return_value = [
+            EventType(id=41, title="15 min meeting", slug="15min", lengthInMinutes=15),
+            EventType(id=42, title="30 min meeting", slug="30min", lengthInMinutes=30),
+        ]
         return m
 
     def test_asks_for_missing_email(self) -> None:
@@ -375,6 +400,10 @@ class TestTimePreferenceHandling:
     def _cal(self) -> MagicMock:
         m = MagicMock(spec=CalClient)
         m.find_slots.return_value = []
+        m.list_event_types.return_value = [
+            EventType(id=41, title="15 min meeting", slug="15min", lengthInMinutes=15),
+            EventType(id=42, title="30 min meeting", slug="30min", lengthInMinutes=30),
+        ]
         return m
 
     def test_unresolved_time_preference_asks_follow_up_and_no_find_slots(self) -> None:
@@ -391,6 +420,68 @@ class TestTimePreferenceHandling:
             reply = handle_message("Book with Jane Thursday afternoon", state, cal)
         cal.find_slots.assert_not_called()
         assert any(word in reply.lower() for word in ("specific", "date", "time", "day", "when", "thursday", "2pm"))
+
+    def test_missing_duration_asks_which_event_type_duration(self) -> None:
+        intent = UserIntent(
+            intent_type=IntentType.book,
+            attendee_name="Jane",
+            attendee_email="jane@example.com",
+            start_time=_T0,
+        )
+        state = self._state()
+        cal = self._cal()
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("Book with Jane tomorrow", state, cal)
+
+        cal.list_event_types.assert_called_once()
+        cal.find_slots.assert_not_called()
+        assert "15" in reply and "30" in reply
+
+    def test_duration_selects_matching_event_type_before_fetching_slots(self) -> None:
+        intent = UserIntent(
+            intent_type=IntentType.book,
+            attendee_name="Jane",
+            attendee_email="jane@example.com",
+            start_time=_T0,
+            duration_minutes=30,
+        )
+        state = self._state()
+        cal = self._cal()
+        with patch("assistant.extract_intent", return_value=intent):
+            handle_message("Book a 30 minute meeting with Jane tomorrow", state, cal)
+
+        cal.find_slots.assert_called_once()
+        _, kwargs = cal.find_slots.call_args
+        assert kwargs["event_type_id"] == 42
+        pending = state["pending_action"]
+        assert pending.booking_draft.include_length_in_minutes is False
+
+    def test_multi_duration_event_type_marks_booking_request_to_send_length(self) -> None:
+        intent = UserIntent(
+            intent_type=IntentType.book,
+            attendee_name="Jane",
+            attendee_email="jane@example.com",
+            start_time=_T0,
+            duration_minutes=30,
+        )
+        state = self._state()
+        cal = self._cal()
+        cal.list_event_types.return_value = [
+            EventType(
+                id=42,
+                title="Flexible meeting",
+                slug="flex",
+                lengthInMinutes=15,
+                lengthInMinutesOptions=[15, 30],
+            ),
+        ]
+        cal.find_slots.return_value = [MagicMock(start=_T0, end=_T1)]
+        with patch("assistant.extract_intent", return_value=intent):
+            handle_message("Book a 30 minute meeting with Jane tomorrow", state, cal)
+            handle_message("1", state, cal)
+
+        request = state["pending_action"].booking_request
+        assert request.include_length_in_minutes is True
 
     def test_resolved_afternoon_preference_passes_afternoon_range_to_find_slots(self) -> None:
         """start_time in early afternoon with no end_time → derived end ≤ 17:00 same day."""

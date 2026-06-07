@@ -15,6 +15,7 @@ from schemas import (
     BookingRequest,
     CalClientError,
     CancelRequest,
+    EventType,
     IntentType,
     IntentValidationError,
     PendingAction,
@@ -23,7 +24,6 @@ from schemas import (
     UserIntent,
 )
 
-_DEFAULT_LLM_MODEL = "gpt-5.4-nano"
 _AFFIRMATIVES = {"yes", "y", "confirm", "sure", "ok", "okay", "yep", "yeah", "do it"}
 _NEGATIVES = {"no", "n", "nope", "nah", "never mind", "nevermind", "don't", "dont"}
 
@@ -115,13 +115,16 @@ def extract_intent(user_text: str, conversation_history: list[dict]) -> UserInte
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise AssistantError("Missing OPENAI_API_KEY", reason="llm_failure")
+    model = os.environ.get("LLM_MODEL", "").strip()
+    if not model:
+        raise AssistantError("Missing LLM_MODEL", reason="llm_failure")
 
     client = _create_openai_client(api_key)
-    model = os.environ.get("LLM_MODEL", _DEFAULT_LLM_MODEL)
     default_tz = os.environ.get("CAL_TIMEZONE", "America/New_York")
     now = datetime.now(timezone.utc)
 
     messages = [
+        {"role": "developer", "content": "Return JSON only."},
         *conversation_history,
         {"role": "user", "content": user_text},
     ]
@@ -195,6 +198,18 @@ def handle_message(
         and pending.action_type in ("cancel", "reschedule")
     ):
         return _handle_match_selection(user_text, pending, session_state, cal_client)
+
+    # --- Short duration follow-up: "15", "30 min", etc. ---
+    duration = _parse_duration_minutes(user_text)
+    if (
+        pending is not None
+        and pending.action_type == "book"
+        and pending.booking_draft is not None
+        and pending.booking_draft.duration_minutes is None
+        and duration is not None
+    ):
+        intent = UserIntent(intent_type=IntentType.book, duration_minutes=duration)
+        return _handle_book(intent, session_state, cal_client)
 
     # --- LLM intent extraction ---
     try:
@@ -271,7 +286,6 @@ def _handle_book(
         _merge_intent_into_draft(draft, intent)
     else:
         default_tz = os.environ.get("CAL_TIMEZONE", "America/New_York")
-        event_type_id = int(os.environ.get("CAL_EVENT_TYPE_ID", "0"))
         draft = BookingDraft(
             attendee_name=intent.attendee_name,
             attendee_email=intent.attendee_email,
@@ -279,7 +293,6 @@ def _handle_book(
             start_time=intent.start_time,
             end_time=intent.end_time,
             timezone=intent.timezone or default_tz,
-            event_type_id=event_type_id,
             time_preference=intent.time_preference,
         )
         pending = PendingAction(action_type="book", booking_draft=draft)
@@ -305,6 +318,10 @@ def _handle_book(
     # All structural fields present — but we need a concrete start_time before fetching slots
     if draft.start_time is None:
         return "What specific date and time works? For example, 'Thursday at 2pm'."
+
+    event_type_prompt = _ensure_booking_event_type(draft, cal_client)
+    if event_type_prompt is not None:
+        return event_type_prompt
 
     # All fields present with concrete start time — fetch slots
     return _fetch_and_show_slots(draft, session_state, cal_client)
@@ -522,6 +539,7 @@ def _handle_slot_selection(
         duration_minutes=draft.duration_minutes or 30,
         timezone=draft.timezone or "UTC",
         event_type_id=draft.event_type_id,
+        include_length_in_minutes=getattr(draft, "include_length_in_minutes", False),
     )
     pending.booking_request = request
     pending.selected_slot = slot
@@ -583,6 +601,108 @@ def _derive_end_time(
     return start + timedelta(minutes=minutes)
 
 
+def _ensure_booking_event_type(
+    draft: BookingDraft, cal_client: CalClient
+) -> Optional[str]:
+    if draft.event_type_id is not None:
+        return None
+
+    event_types = cal_client.list_event_types()
+    if not event_types:
+        return "I couldn't find any Cal.com event types. Please create one in Cal.com first."
+
+    usable_event_types = _prefer_visible_event_types(event_types)
+    if draft.duration_minutes is None:
+        durations = _available_durations(usable_event_types)
+        if len(durations) == 1:
+            draft.duration_minutes = durations[0]
+        else:
+            return f"How long should it be — {_format_duration_options(durations)} minutes?"
+
+    selected = _select_event_type_for_duration(usable_event_types, draft.duration_minutes)
+    if selected is None:
+        durations = _available_durations(usable_event_types)
+        return (
+            f"I don't see a {draft.duration_minutes}-minute event type. "
+            f"Available options are {_format_duration_options(durations)} minutes."
+        )
+
+    draft.event_type_id = selected.id
+    draft.include_length_in_minutes = _has_multiple_durations(selected)
+    if draft.duration_minutes is None:
+        draft.duration_minutes = selected.length_minutes
+    return None
+
+
+def _event_type_id_for_booking(
+    booking: Booking, cal_client: CalClient
+) -> Optional[int]:
+    if booking.event_type_id is not None:
+        return booking.event_type_id
+
+    duration = round((booking.end - booking.start).total_seconds() / 60)
+    try:
+        event_types = cal_client.list_event_types()
+    except CalClientError:
+        raise
+    except Exception:
+        return None
+    selected = _select_event_type_for_duration(
+        _prefer_visible_event_types(event_types), duration
+    )
+    return selected.id if selected else None
+
+
+def _prefer_visible_event_types(event_types: list[EventType]) -> list[EventType]:
+    visible = [event_type for event_type in event_types if not event_type.hidden]
+    return visible or event_types
+
+
+def _available_durations(event_types: list[EventType]) -> list[int]:
+    durations: set[int] = set()
+    for event_type in event_types:
+        durations.update(event_type.supported_durations())
+    return sorted(durations)
+
+
+def _has_multiple_durations(event_type: EventType) -> bool:
+    return len(event_type.supported_durations()) > 1
+
+
+def _select_event_type_for_duration(
+    event_types: list[EventType], duration_minutes: Optional[int]
+) -> Optional[EventType]:
+    if duration_minutes is None:
+        return event_types[0] if len(event_types) == 1 else None
+
+    candidates = [
+        event_type
+        for event_type in event_types
+        if duration_minutes in event_type.supported_durations()
+    ]
+    if not candidates:
+        return None
+
+    exact_length = [
+        event_type
+        for event_type in candidates
+        if event_type.length_minutes == duration_minutes
+    ]
+    preferred = exact_length or candidates
+    return sorted(preferred, key=lambda event_type: event_type.title.lower())[0]
+
+
+def _format_duration_options(durations: list[int]) -> str:
+    if not durations:
+        return "an available duration"
+    labels = [str(duration) for duration in durations]
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return f"{labels[0]} or {labels[1]}"
+    return f"{', '.join(labels[:-1])}, or {labels[-1]}"
+
+
 def _fetch_and_show_slots(
     draft: BookingDraft,
     session_state: dict,
@@ -607,6 +727,7 @@ def _fetch_and_show_slots(
         duration_minutes=draft.duration_minutes,
         timezone=draft.timezone,
         booking_uid_to_reschedule=booking_uid_to_reschedule,
+        event_type_id=draft.event_type_id,
     )
 
     if not slots:
@@ -636,12 +757,16 @@ def _fetch_reschedule_slots(
         None,
         tz,
     )
+    event_type_id = _event_type_id_for_booking(booking, cal_client)
+    if event_type_id is None:
+        return "I couldn't identify the event type for that booking."
 
     slots = cal_client.find_slots(
         start=start,
         end=end,
         timezone=tz,
         booking_uid_to_reschedule=booking.uid,
+        event_type_id=event_type_id,
     )
 
     if not slots:
@@ -652,7 +777,7 @@ def _fetch_reschedule_slots(
     # Store the booking we're rescheduling in a temporary draft
     draft = BookingDraft(
         attendee_name=booking.attendees[0].name if booking.attendees else None,
-        event_type_id=int(os.environ.get("CAL_EVENT_TYPE_ID", "0")),
+        event_type_id=event_type_id,
         timezone=tz,
     )
     pending = PendingAction(
@@ -842,6 +967,8 @@ def _multiple_matches_text(bookings: list[Booking], action: str) -> str:
 def _format_cal_error(exc: CalClientError) -> str:
     if exc.status_code == 401:
         return "There's an issue with the Cal.com API key. Please check your configuration."
+    if exc.status_code == 400:
+        return f"Cal.com rejected the booking request: {exc.message}"
     if exc.status_code == 429:
         return "Cal.com is busy right now. Please try again in a moment."
     return "Something went wrong with Cal.com. Please try again."
@@ -880,6 +1007,14 @@ def _is_negative(text: str) -> bool:
 
 def _is_cancel_word(text: str) -> bool:
     return text.strip().lower() == "cancel"
+
+
+def _parse_duration_minutes(text: str) -> Optional[int]:
+    normalized = text.strip().lower()
+    match = re.fullmatch(r"(\d{1,3})(?:\s*(?:m|min|mins|minute|minutes))?", normalized)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def _is_valid_email(email: str) -> bool:

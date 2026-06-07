@@ -10,13 +10,13 @@ import streamlit as st
 
 from assistant import handle_message
 from cal_client import CalClient, build_from_env
-from schemas import PendingAction, Slot
+from schemas import CalClientError, PendingAction, Slot
 
 _REQUIRED_ENV_VARS = (
     "CAL_API_KEY",
-    "CAL_EVENT_TYPE_ID",
     "CAL_USERNAME",
     "OPENAI_API_KEY",
+    "LLM_MODEL",
 )
 
 _WELCOME = (
@@ -56,8 +56,25 @@ def _missing_required_env() -> list[str]:
     return [name for name in _REQUIRED_ENV_VARS if not os.environ.get(name, "").strip()]
 
 
+def _dispatch_error_reply(exc: Exception) -> str:
+    if isinstance(exc, CalClientError):
+        if exc.status_code == 400:
+            return f"Cal.com rejected the booking request: {exc.message}"
+        if exc.status_code == 401:
+            return "There's an issue with the Cal.com API key. Please check your configuration."
+        if exc.status_code == 429:
+            return "Cal.com is busy right now. Please try again in a moment."
+        if exc.reason in ("timeout", "network"):
+            return "Cal.com timed out or could not be reached. Please try again."
+        return "Something went wrong with Cal.com. Please try again."
+    return "Something went wrong while handling that request. Please try again."
+
+
 def _dispatch(user_text: str, cal_client: CalClient) -> None:
-    reply = handle_message(user_text, st.session_state, cal_client)
+    try:
+        reply = handle_message(user_text, st.session_state, cal_client)
+    except Exception as exc:
+        reply = _dispatch_error_reply(exc)
     st.session_state["messages"].append({"role": "user", "content": user_text})
     st.session_state["messages"].append({"role": "assistant", "content": reply})
 

@@ -36,22 +36,24 @@ Edit `.env`:
 ```
 CAL_API_KEY=your_cal_api_key_here
 CAL_API_BASE_URL=https://api.cal.com/v2
-CAL_EVENT_TYPE_ID=your_event_type_id
 CAL_USERNAME=your_cal_username
 CAL_TIMEZONE=America/New_York
 OPENAI_API_KEY=your_openai_api_key_here
-LLM_MODEL=gpt-5.4-nano
+LLM_MODEL=your_openai_model_here
 ```
 
 | Variable | Required | Description |
 |---|---|---|
 | `CAL_API_KEY` | Yes | Cal.com API key (v2) |
-| `CAL_EVENT_TYPE_ID` | Yes | ID of the event type used for booking |
 | `CAL_USERNAME` | Yes | Your Cal.com username |
 | `CAL_API_BASE_URL` | No | Defaults to `https://api.cal.com/v2` |
 | `CAL_TIMEZONE` | No | Defaults to `America/New_York` |
 | `OPENAI_API_KEY` | Yes | OpenAI API key for intent extraction |
-| `LLM_MODEL` | No | Defaults to `gpt-5.4-nano` |
+| `LLM_MODEL` | Yes | OpenAI model to use for intent extraction |
+
+The app reads your Cal.com event types automatically. For booking, it picks the
+matching type by duration, such as `15 min meeting` or `30 min meeting`. If the
+duration is unclear, it asks which duration to use.
 
 ### 5. Run the app
 

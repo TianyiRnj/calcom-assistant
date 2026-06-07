@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 
 def _require_tz_aware(v: datetime | None) -> datetime | None:
@@ -45,6 +45,9 @@ class Booking(BaseModel):
     end: datetime
     attendees: list[Attendee] = Field(default_factory=list)
     status: str = "accepted"
+    event_type_id: Optional[int] = Field(
+        default=None, validation_alias=AliasChoices("eventTypeId", "event_type_id")
+    )
 
     @field_validator("start", "end", mode="after")
     @classmethod
@@ -52,6 +55,25 @@ class Booking(BaseModel):
         if v.tzinfo is None:
             raise ValueError("datetime must be timezone-aware")
         return v
+
+
+class EventType(BaseModel):
+    id: int
+    title: str
+    slug: str
+    length_minutes: int = Field(
+        validation_alias=AliasChoices("lengthInMinutes", "length_minutes")
+    )
+    length_minutes_options: list[int] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("lengthInMinutesOptions", "length_minutes_options"),
+    )
+    hidden: bool = False
+
+    def supported_durations(self) -> list[int]:
+        durations = set(self.length_minutes_options)
+        durations.add(self.length_minutes)
+        return sorted(durations)
 
 
 class UserIntent(BaseModel):
@@ -82,6 +104,7 @@ class BookingDraft(BaseModel):
     duration_minutes: Optional[int] = None
     timezone: Optional[str] = None
     event_type_id: Optional[int] = None
+    include_length_in_minutes: bool = False
     time_preference: Optional[str] = None
 
     @field_validator("start_time", "end_time", mode="after")
@@ -114,6 +137,7 @@ class BookingRequest(BaseModel):
     duration_minutes: int
     timezone: str
     event_type_id: int
+    include_length_in_minutes: bool = False
 
     @field_validator("start_time", mode="after")
     @classmethod
