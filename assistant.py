@@ -1255,7 +1255,7 @@ def handle_message(
             return _handle_reschedule(intent, session_state, cal_client)
         else:
             return (
-                "I can only help with scheduling — booking, canceling, or rescheduling events."
+                "I can only help with scheduling — listing, booking, canceling, or rescheduling events."
             )
     except CalClientError as exc:
         return _format_cal_error(exc)

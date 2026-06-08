@@ -31,7 +31,7 @@ Recommended runtime and libraries:
 - `pydantic` for request, response, intent, and action schemas.
 - `python-dotenv` for local environment variable loading.
 - `pytest` for tests.
-- One LLM provider for natural-language intent extraction and assistant replies.
+- One LLM provider for natural-language intent extraction.
 
 Do not introduce a database for the MVP. Use Streamlit session state for temporary chat state and pending actions.
 
@@ -107,12 +107,18 @@ If the implementation grows beyond the MVP, create a `src/` package only when it
 Use environment variables for credentials and local configuration.
 
 ```text
+# Required
 CAL_API_KEY=
 CAL_API_BASE_URL=https://api.cal.com/v2
-CAL_EVENT_TYPE_ID=
 CAL_USERNAME=
 CAL_TIMEZONE=America/New_York
-LLM_API_KEY=
+OPENAI_API_KEY=
+LLM_MODEL=
+
+# Optional
+CAL_DISPLAY_TIMEZONE=          # override display timezone (defaults to CAL_TIMEZONE)
+LLM_EXTRACTION_MAX_RETRIES=2   # semantic retry count (default 2)
+CAL_EVENT_TYPE_ID=             # pin a specific event type; auto-detected if absent
 ```
 
 Rules:
@@ -120,7 +126,7 @@ Rules:
 - Never hard-code API keys.
 - Never commit `.env`.
 - Commit `.env.example` with empty placeholder values.
-- Treat `CAL_TIMEZONE` as the default timezone unless the user explicitly asks for another timezone.
+- `CAL_TIMEZONE` is the default timezone for booking matching and display unless overridden by `CAL_DISPLAY_TIMEZONE`.
 
 ## Code Style
 
@@ -196,9 +202,8 @@ Handle these cases explicitly:
 - Missing attendee name.
 - Missing attendee email.
 - Invalid attendee email.
-- No matching booking found.
-- Multiple matching bookings found.
-- Already canceled booking.
+- No matching upcoming booking found — cancelled-only matches are treated the same as no match because only upcoming bookings are searched.
+- Multiple upcoming bookings match the request, including when a broad source time window overlaps more than one booking.
 - Unsupported user action.
 - No available slots.
 - Selected slot becomes unavailable.
@@ -262,8 +267,8 @@ Invalid action tests:
 - User asks to book in the past and the assistant explains that it can only book future times.
 - User asks to book outside available hours and the assistant offers the nearest available slots.
 - User asks to cancel an event that does not exist and the assistant says no matching booking was found.
+- User tries to cancel or reschedule a booking that only exists in cancelled status — the assistant returns a not-found response because only upcoming bookings are searched, and no calendar-changing API call is made.
 - User asks to reschedule an event that does not exist and the assistant asks for more identifying details.
-- User asks to cancel or reschedule a booking that is already canceled and the assistant does not call the API again.
 - User confirms a booking after the selected slot has become unavailable and the assistant asks the user to choose a new slot.
 - User provides an invalid attendee email and the assistant asks for a corrected email address.
 - User asks for an unsupported action, such as "send Jane the notes", and the assistant explains that it can only manage scheduling actions.
@@ -272,6 +277,7 @@ Corner case tests:
 
 - Multiple bookings match a cancellation request and the assistant asks the user to pick the exact booking.
 - Multiple bookings match a reschedule request and the assistant asks the user to pick the exact booking.
+- A broad source time window overlapping multiple upcoming bookings causes the assistant to show a numbered choice list — this is expected behavior, not a bug.
 - Two attendees have the same first name and the assistant uses email, title, or time to disambiguate.
 - User changes their mind mid-flow, such as starting a booking and then asking to list tomorrow's events.
 - User says "yes" or "confirm" when there is no pending action and the assistant asks what they want to do.

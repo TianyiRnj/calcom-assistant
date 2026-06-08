@@ -397,6 +397,44 @@ class TestCancelFlow:
         assert any(b.uid == "uid-130" for b in pending.matching_bookings)
         cal.cancel_booking.assert_not_called()
 
+    def test_broad_source_window_cancel_multiple_bookings_shows_choices(self) -> None:
+        """A broad source time window overlapping multiple upcoming bookings
+        produces a numbered choice list without cancelling anything."""
+        afternoon_start = datetime(2050, 9, 5, 12, 0, 0, tzinfo=timezone.utc)  # noon
+        afternoon_end = datetime(2050, 9, 5, 17, 0, 0, tzinfo=timezone.utc)  # 5 PM
+        b1 = _sample_booking(
+            uid="uid-1",
+            title="Morning Call",
+            start=datetime(2050, 9, 5, 14, 0, tzinfo=timezone.utc),
+            end=datetime(2050, 9, 5, 14, 30, tzinfo=timezone.utc),
+        )
+        b2 = _sample_booking(
+            uid="uid-2",
+            title="Afternoon Sync",
+            start=datetime(2050, 9, 5, 15, 0, tzinfo=timezone.utc),
+            end=datetime(2050, 9, 5, 15, 30, tzinfo=timezone.utc),
+        )
+        cal = _mock_cal()
+        cal.list_bookings.return_value = [b1, b2]
+        # Broad source window spans both same-day bookings; no text filters → vague fallback
+        intent = _intent(
+            intent_type=IntentType.cancel,
+            source_start_time=afternoon_start,
+            source_end_time=afternoon_end,
+        )
+        state = _state()
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("cancel my call this afternoon", state, cal)
+
+        pending = state["pending_action"]
+        assert pending is not None
+        assert len(pending.matching_bookings) == 2
+        assert any(b.uid == "uid-1" for b in pending.matching_bookings)
+        assert any(b.uid == "uid-2" for b in pending.matching_bookings)
+        assert "1." in reply
+        assert "2." in reply
+        cal.cancel_booking.assert_not_called()
+
 
 # ===========================================================================
 # TestRescheduleFlow
@@ -552,6 +590,69 @@ class TestRescheduleFlow:
         assert find_kwargs["booking_uid_to_reschedule"] == "uid-tom-jack"
         assert find_kwargs["start"] == target_start
         cal.reschedule_booking.assert_called_once_with("uid-tom-jack", target_start)
+
+    def test_cancelled_only_reschedule_treated_as_not_found(self) -> None:
+        """Cancelled bookings are omitted from upcoming results; reschedule returns not-found.
+
+        list_bookings is queried once with status="upcoming"; no separate cancelled
+        lookup is made and reschedule_booking is never called.
+        """
+        cal = _mock_cal()
+        # Simulates that the matching booking exists only in cancelled status —
+        # list_bookings(status="upcoming") returns nothing for it.
+        cal.list_bookings.return_value = []
+        intent = _intent(
+            intent_type=IntentType.reschedule,
+            attendee_name="Jane",
+            start_time=_T2,
+        )
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("Move my call with Jane to tomorrow", _state(), cal)
+
+        assert "not found" in reply.lower() or "couldn't find" in reply.lower()
+        cal.list_bookings.assert_called_once()
+        _, kwargs = cal.list_bookings.call_args
+        assert kwargs.get("status") == "upcoming"
+        cal.reschedule_booking.assert_not_called()
+
+    def test_broad_source_window_reschedule_multiple_bookings_shows_choices(self) -> None:
+        """A broad source time window overlapping multiple upcoming bookings
+        produces a numbered choice list without rescheduling anything."""
+        afternoon_start = datetime(2050, 9, 5, 12, 0, 0, tzinfo=timezone.utc)  # noon
+        afternoon_end = datetime(2050, 9, 5, 17, 0, 0, tzinfo=timezone.utc)  # 5 PM
+        b1 = _sample_booking(
+            uid="uid-1",
+            title="Call A",
+            start=datetime(2050, 9, 5, 14, 0, tzinfo=timezone.utc),
+            end=datetime(2050, 9, 5, 14, 30, tzinfo=timezone.utc),
+        )
+        b2 = _sample_booking(
+            uid="uid-2",
+            title="Call B",
+            start=datetime(2050, 9, 5, 15, 0, tzinfo=timezone.utc),
+            end=datetime(2050, 9, 5, 15, 30, tzinfo=timezone.utc),
+        )
+        cal = _mock_cal()
+        cal.list_bookings.return_value = [b1, b2]
+        # Broad source window spans both bookings; target is a clearly different day
+        intent = _intent(
+            intent_type=IntentType.reschedule,
+            source_start_time=afternoon_start,
+            source_end_time=afternoon_end,
+            start_time=_T2,  # Sep 6 10:00 — unambiguously outside the source window
+        )
+        state = _state()
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("move my call this afternoon to tomorrow morning", state, cal)
+
+        pending = state["pending_action"]
+        assert pending is not None
+        assert len(pending.matching_bookings) == 2
+        assert any(b.uid == "uid-1" for b in pending.matching_bookings)
+        assert any(b.uid == "uid-2" for b in pending.matching_bookings)
+        assert "1." in reply
+        assert "2." in reply
+        cal.reschedule_booking.assert_not_called()
 
 
 # ===========================================================================
@@ -1542,7 +1643,9 @@ class TestTokenBasedMatching:
         assert isinstance(reply, str)
 
     def test_no_cancelled_lookup_on_no_match(self) -> None:
-        """When no upcoming bookings match, list_bookings is called only once (no cancelled lookup)."""
+        """Cancelled bookings are omitted from upcoming results, so the assistant treats them
+        as no match. list_bookings is queried once with status="upcoming"; no separate
+        cancelled lookup is made and cancel_booking is never called."""
         cal = _mock_cal()
         cal.list_bookings.return_value = []
         intent = _intent(intent_type=IntentType.cancel, attendee_name="nonexistent")
@@ -1550,6 +1653,9 @@ class TestTokenBasedMatching:
             reply = handle_message("cancel my meeting with nonexistent", _state(), cal)
         assert "not found" in reply.lower() or "couldn't find" in reply.lower()
         cal.list_bookings.assert_called_once()
+        _, kwargs = cal.list_bookings.call_args
+        assert kwargs.get("status") == "upcoming"
+        cal.cancel_booking.assert_not_called()
 
 
 # ===========================================================================
