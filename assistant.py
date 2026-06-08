@@ -1185,12 +1185,12 @@ def _handle_slot_unavailable(
 
 def _restate_confirmation(pending: PendingAction) -> str:
     if pending.booking_request is not None:
-        return "Say yes to confirm or no to cancel."
+        return "Confirm or decline above."
     if pending.cancel_request is not None:
-        return "Say yes to cancel this booking, or no to keep it."
+        return "Confirm to cancel this booking, or decline to keep it."
     if pending.reschedule_request is not None:
-        return "Say yes to reschedule, or no to keep the original time."
-    return "Say yes to confirm or no to cancel."
+        return "Confirm to reschedule, or decline to keep the original time."
+    return "Confirm or decline above."
 
 
 # ---------------------------------------------------------------------------
@@ -1231,7 +1231,7 @@ def _handle_slot_selection(
     slot_line = _format_slot_option(idx, slot)
     return (
         f"You selected:\n  {slot_line}\n"
-        f"Book a {duration}-minute call with {request.attendee_name} at this time? Say yes or no."
+        f"Book a {duration}-minute call with {request.attendee_name} at this time?"
     )
 
 
@@ -1824,7 +1824,7 @@ def _handle_slot_selection_for_reschedule(
     slot_line = _format_slot_option(idx, slot)
     return (
         f"You selected:\n  {slot_line}\n"
-        f"Reschedule to this time? Say yes or no."
+        f"Reschedule to this time?"
     )
 
 

@@ -4,26 +4,20 @@ A conversational web chat UI for managing your Cal.com calendar through natural 
 
 ## Setup
 
-### 1. Clone and enter the directory
-
-```bash
-cd "LiveX AI"
-```
-
-### 2. Create a virtual environment
+### 1. Create a virtual environment
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-### 3. Install dependencies
+### 2. Install dependencies
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-### 4. Configure environment variables
+### 3. Configure environment variables
 
 Copy the example file and fill in your credentials:
 
@@ -55,7 +49,7 @@ The app reads your Cal.com event types automatically. For booking, it picks the
 matching type by duration, such as `15 min meeting` or `30 min meeting`. If the
 duration is unclear, it asks which duration to use.
 
-### 5. Run the app
+### 4. Run the app
 
 ```bash
 python -m streamlit run app.py
