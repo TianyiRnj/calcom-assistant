@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 
 def _require_tz_aware(v: datetime | None) -> datetime | None:
@@ -25,6 +25,73 @@ class IntentType(str, Enum):
 class Attendee(BaseModel):
     name: str
     email: str
+
+
+class ExtractedAttendee(BaseModel):
+    """Extraction-only attendee shape from LLM output. Both fields are optional
+    because the user may mention only a name or only an email."""
+
+    name: Optional[str] = None
+    email: Optional[str] = None
+
+
+class ExtractedIntent(BaseModel):
+    """Internal model for raw LLM extraction output only.
+    Never stored in session state or sent to Cal.com.
+    Must be mapped to UserIntent via _map_extracted_to_intent() before use."""
+
+    intent_type: IntentType
+    attendees: list[ExtractedAttendee] = Field(default_factory=list)
+    event_name: Optional[str] = None
+    search_text: Optional[str] = None
+    booking_uid: Optional[str] = None
+    source_start_time: Optional[datetime] = None
+    source_duration_minutes: Optional[int] = None
+    target_start_time: Optional[datetime] = None
+    target_duration_minutes: Optional[int] = None
+    date_range_start: Optional[datetime] = None
+    date_range_end: Optional[datetime] = None
+    relative_time_qualifier: Optional[Literal["earlier", "mid", "later"]] = None
+    timezone: Optional[str] = None
+
+    @field_validator(
+        "source_start_time",
+        "target_start_time",
+        "date_range_start",
+        "date_range_end",
+        mode="after",
+    )
+    @classmethod
+    def must_be_tz_aware(cls, v: datetime | None) -> datetime | None:
+        return _require_tz_aware(v)
+
+    @model_validator(mode="after")
+    def apply_defaults_and_validate(self) -> "ExtractedIntent":
+        # date_range_start and date_range_end must both be set or both null
+        if (self.date_range_start is None) != (self.date_range_end is None):
+            raise ValueError(
+                "date_range_start and date_range_end must both be set or both null"
+            )
+        # Default source_duration_minutes to 30 when source_start_time is present
+        if self.source_start_time is not None and self.source_duration_minutes is None:
+            self.source_duration_minutes = 30
+        # Default target_duration_minutes when target_start_time is present
+        if self.target_start_time is not None and self.target_duration_minutes is None:
+            self.target_duration_minutes = self.source_duration_minutes or 30
+        # Clamp durations to valid range
+        if self.source_duration_minutes is not None and not (
+            5 <= self.source_duration_minutes <= 480
+        ):
+            raise ValueError(
+                f"source_duration_minutes {self.source_duration_minutes} out of range [5, 480]"
+            )
+        if self.target_duration_minutes is not None and not (
+            5 <= self.target_duration_minutes <= 480
+        ):
+            raise ValueError(
+                f"target_duration_minutes {self.target_duration_minutes} out of range [5, 480]"
+            )
+        return self
 
 
 class Slot(BaseModel):
@@ -82,6 +149,10 @@ class UserIntent(BaseModel):
     search_text: Optional[str] = None
     attendee_name: Optional[str] = None
     attendee_email: Optional[str] = None
+    # Multi-attendee list from structured extraction; attendee_name/email kept for backward compat
+    attendees: list[ExtractedAttendee] = Field(default_factory=list)
+    # Event/title keywords for title-only matching; kept separate from search_text fallback
+    event_name: Optional[str] = None
     duration_minutes: Optional[int] = None
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
@@ -181,6 +252,7 @@ class PendingAction(BaseModel):
     selected_slot: Optional[Slot] = None
     matching_bookings: list[Booking] = Field(default_factory=list)
     waiting_for_field: Optional[str] = None  # "attendee_name" | "attendee_email"
+    matching_bookings_are_partial: bool = False  # True when candidates came from Tier 4 or vague fallback
 
 
 class CalClientError(Exception):

@@ -116,6 +116,19 @@ _STREAMLIT_CHROME_PATCH_HTML = """
       header .cal-hidden-toolbar-action {
         display: none !important;
       }
+
+      .cal-conn-cmd {
+        background: #1e2937 !important;
+        border-radius: 6px !important;
+        color: #e2e8f0 !important;
+        display: block !important;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
+        font-size: 0.85rem !important;
+        padding: 0.5rem 0.75rem !important;
+        user-select: all !important;
+        border: none !important;
+        outline: none !important;
+      }
     `;
     parentDoc.head.appendChild(style);
   }
@@ -290,6 +303,99 @@ _STREAMLIT_CHROME_PATCH_HTML = """
     );
   }
 
+  const CONN_CMD = "python -m streamlit run app.py";
+  const CONN_CMD_WRONG = "streamlit run yourscript.py";
+  const CONN_TITLE_NEW = "Streamlit disconnected";
+  const CONN_BODY_NEW =
+    "The local Streamlit server is not reachable or is restarting. Restart it from the project root:";
+
+  function isConnectionErrorContainer(el) {
+    const text = el.textContent || "";
+    return (
+      text.includes("Connection error") ||
+      text.includes("Is Streamlit still running") ||
+      text.includes(CONN_CMD_WRONG)
+    );
+  }
+
+  function walkTextNodes(root, fn) {
+    const walker = parentDoc.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    const nodes = [];
+    let node;
+    while ((node = walker.nextNode())) nodes.push(node);
+    nodes.forEach(fn);
+  }
+
+  function patchConnectionErrorModal() {
+    const candidates = Array.from(
+      parentDoc.querySelectorAll(
+        '[role="dialog"], [data-testid="stModal"], .stModal, [class*="Modal"], [class*="modal"]'
+      )
+    ).filter(isConnectionErrorContainer);
+
+    if (candidates.length === 0) {
+      Array.from(parentDoc.body.children).forEach((child) => {
+        if (isConnectionErrorContainer(child)) candidates.push(child);
+      });
+    }
+
+    candidates.forEach((container) => {
+      if (container.dataset.calConnPatched === "1") return;
+      container.dataset.calConnPatched = "1";
+
+      // Replace text nodes for title and body copy
+      walkTextNodes(container, (node) => {
+        const val = node.nodeValue || "";
+        if (val.includes("Connection error")) {
+          node.nodeValue = val.replace(/Connection error/g, CONN_TITLE_NEW);
+        }
+        if (
+          val.includes("Is Streamlit still running") ||
+          (val.includes("Streamlit") && val.includes("running") && val.includes("check"))
+        ) {
+          node.nodeValue = CONN_BODY_NEW;
+        }
+        if (val.includes(CONN_CMD_WRONG)) {
+          node.nodeValue = val.replace(CONN_CMD_WRONG, CONN_CMD);
+        }
+      });
+
+      // Replace text in code/pre elements and mark them with neutral style
+      container.querySelectorAll("code, pre").forEach((el) => {
+        if (el.textContent.includes(CONN_CMD_WRONG)) {
+          el.textContent = CONN_CMD;
+          el.classList.add("cal-conn-cmd");
+        }
+      });
+
+      // Intercept copy buttons so they copy the correct command
+      container.querySelectorAll("button").forEach((btn) => {
+        const label = [
+          btn.getAttribute("aria-label"),
+          btn.getAttribute("title"),
+          btn.textContent,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        if (label.includes("copy")) {
+          if (btn.dataset.calConnCopyPatched === "1") return;
+          btn.dataset.calConnCopyPatched = "1";
+          btn.addEventListener(
+            "click",
+            (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              navigator.clipboard &&
+                navigator.clipboard.writeText(CONN_CMD).catch(() => {});
+            },
+            { capture: true }
+          );
+        }
+      });
+    });
+  }
+
   function patch() {
     ensureStyle();
     patchFileChangeNotice();
@@ -297,6 +403,7 @@ _STREAMLIT_CHROME_PATCH_HTML = """
     patchCacheShortcutText();
     hidePersistentToolbarActions();
     installShortcutGuard();
+    patchConnectionErrorModal();
   }
 
   patch();

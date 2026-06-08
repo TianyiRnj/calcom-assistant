@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+## Workflow
+
+Before making any code changes, generate a plan describing what you intend to do and wait for explicit approval. Do not touch any files until the plan is approved.
+
 ## Project Overview
 
 This is a single-developer project. There is no CI, no multi-contributor workflow, and no need for automated guardrails that exist only to protect a team. Keep tooling minimal.
