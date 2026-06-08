@@ -1,10 +1,9 @@
 """End-to-end conversation flow tests — all Cal.com calls and LLM calls are mocked."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
-
-import pytest
+from zoneinfo import ZoneInfo
 
 from assistant import handle_message
 from cal_client import CalClient
@@ -98,6 +97,44 @@ class TestListingFlow:
             reply = handle_message("What's on my calendar?", _state(), cal)
         assert any(word in reply.lower() for word in ("nothing", "no events", "empty", "scheduled"))
 
+    def test_bare_tomorrow_lists_local_tomorrow_without_llm(self) -> None:
+        ny = ZoneInfo("America/New_York")
+        local_now = datetime(2026, 6, 7, 22, 30, 0, tzinfo=ny)
+        cal = _mock_cal()
+        cal.list_bookings.return_value = []
+
+        with (
+            patch("assistant._local_now", return_value=local_now),
+            patch("assistant.extract_intent") as mock_extract,
+        ):
+            reply = handle_message("tomorrow", _state(), cal)
+
+        mock_extract.assert_not_called()
+        assert "nothing" in reply.lower()
+        kwargs = cal.list_bookings.call_args.kwargs
+        assert kwargs["start"] == datetime(2026, 6, 8, 0, 0, 0, tzinfo=ny)
+        assert kwargs["end"] == datetime(2026, 6, 9, 0, 0, 0, tzinfo=ny)
+
+    def test_what_happen_next_week_is_stable_across_repeats(self) -> None:
+        ny = ZoneInfo("America/New_York")
+        local_now = datetime(2026, 6, 7, 22, 30, 0, tzinfo=ny)
+        cal = _mock_cal()
+        cal.list_bookings.return_value = []
+        state = _state()
+
+        with (
+            patch("assistant._local_now", return_value=local_now),
+            patch("assistant.extract_intent") as mock_extract,
+        ):
+            handle_message("what happen next week", state, cal)
+            handle_message("what happen next week", state, cal)
+            handle_message("what is on my calendar next week", state, cal)
+
+        mock_extract.assert_not_called()
+        for call in cal.list_bookings.call_args_list:
+            assert call.kwargs["start"] == datetime(2026, 6, 8, 0, 0, 0, tzinfo=ny)
+            assert call.kwargs["end"] == datetime(2026, 6, 15, 0, 0, 0, tzinfo=ny)
+
 
 # ===========================================================================
 # TestBookingFlow
@@ -122,24 +159,21 @@ class TestBookingFlow:
         cal.create_booking.assert_not_called()
 
     def test_booking_turn2_email_provided_fetches_slots(self) -> None:
+        # Turn 1 intent has a concrete start_time so that when the email is direct-merged
+        # on turn 2 (bypassing the LLM), the draft is already complete.
         intent1 = _intent(
             intent_type=IntentType.book,
             attendee_name="Jane",
             duration_minutes=30,
-            time_preference="Thursday",
-        )
-        # intent2 includes start_time — simulates LLM resolving the date with updated prompt
-        intent2 = _intent(
-            intent_type=IntentType.book,
-            attendee_email="jane@example.com",
             start_time=_T0,
         )
         state = _state()
         cal = _mock_cal()
         cal.find_slots.return_value = [_sample_slot()]
-        with patch("assistant.extract_intent", side_effect=[intent1, intent2]):
-            handle_message("Book with Jane Thursday", state, cal)   # → asks for email
-            reply = handle_message("jane@example.com", state, cal)  # → fetches slots
+        with patch("assistant.extract_intent", return_value=intent1):
+            handle_message("Book with Jane at 2pm", state, cal)  # → asks for email
+        # Turn 2: email direct-merged without LLM call
+        reply = handle_message("jane@example.com", state, cal)
         cal.find_slots.assert_called_once()
         cal.create_booking.assert_not_called()
         # Reply should present slot options
@@ -161,7 +195,7 @@ class TestBookingFlow:
         state["available_slots"] = [_sample_slot()]
         cal = _mock_cal()
         reply = handle_message("1", state, cal)
-        assert "yes" in reply.lower() or "confirm" in reply.lower() or "no" in reply.lower()
+        assert "?" in reply
         assert state["pending_action"].booking_request is not None
         cal.create_booking.assert_not_called()
 
@@ -179,7 +213,7 @@ class TestBookingFlow:
             ),
         )
         cal = _mock_cal()
-        reply = handle_message("yes", state, cal)
+        handle_message("yes", state, cal)
         cal.create_booking.assert_called_once()
         assert state["pending_action"] is None
 
@@ -271,7 +305,7 @@ class TestCancelFlow:
             cancel_request=CancelRequest(booking_uid="uid-123"),
         )
         cal = _mock_cal()
-        reply = handle_message("yes", state, cal)
+        handle_message("yes", state, cal)
         cal.cancel_booking.assert_called_once_with("uid-123")
         assert state["pending_action"] is None
 
@@ -293,6 +327,54 @@ class TestCancelFlow:
         with patch("assistant.extract_intent", return_value=intent):
             reply = handle_message("Cancel my call with Jane", _state(), cal)
         assert "not found" in reply.lower() or "couldn't find" in reply.lower() or "no matching" in reply.lower()
+        cal.cancel_booking.assert_not_called()
+
+    def test_cancel_tomorrow_meeting_matches_by_date_window(self) -> None:
+        tomorrow_start = datetime(2050, 9, 6, 0, 0, 0, tzinfo=timezone.utc)
+        tomorrow_end = datetime(2050, 9, 7, 0, 0, 0, tzinfo=timezone.utc)
+        cal = _mock_cal()
+        cal.list_bookings.return_value = [
+            _sample_booking(uid="uid-today", title="Intro Call"),
+            _sample_booking(uid="uid-tomorrow", title="Team Sync", start=_T2, end=_T3),
+        ]
+        intent = _intent(
+            intent_type=IntentType.cancel,
+            search_text="meeting",
+            start_time=tomorrow_start,
+            end_time=tomorrow_end,
+        )
+        state = _state()
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("Cancel tomorrow meeting", state, cal)
+
+        assert "Team Sync" in reply
+        assert state["pending_action"].cancel_request is not None
+        assert state["pending_action"].cancel_request.booking_uid == "uid-tomorrow"
+        cal.cancel_booking.assert_not_called()
+
+    def test_cancel_the_meeting_at_time_strips_filler_words(self) -> None:
+        ny = ZoneInfo("America/New_York")
+        local_now = datetime(2026, 6, 7, 22, 30, 0, tzinfo=ny)
+        meeting = _sample_booking(
+            uid="uid-130",
+            title="30 min meeting between Tianyi Ren and tom and jack",
+            start=datetime(2026, 6, 8, 13, 30, 0, tzinfo=ny),
+            end=datetime(2026, 6, 8, 14, 0, 0, tzinfo=ny),
+        )
+        cal = _mock_cal()
+        cal.list_bookings.return_value = [meeting]
+        state = _state()
+
+        with (
+            patch("assistant._local_now", return_value=local_now),
+            patch("assistant.extract_intent") as mock_extract,
+        ):
+            reply = handle_message("cancel the meeting tomorrow at 1:30", state, cal)
+
+        mock_extract.assert_not_called()
+        assert "tom and jack" in reply
+        assert state["pending_action"].cancel_request is not None
+        assert state["pending_action"].cancel_request.booking_uid == "uid-130"
         cal.cancel_booking.assert_not_called()
 
 
@@ -353,7 +435,7 @@ class TestRescheduleFlow:
             ),
         )
         cal = _mock_cal()
-        reply = handle_message("yes", state, cal)
+        handle_message("yes", state, cal)
         cal.reschedule_booking.assert_called_once_with("uid-123", _T2)
         assert state["pending_action"] is None
 
@@ -368,7 +450,7 @@ class TestRescheduleFlow:
         )
         with patch("assistant.extract_intent", return_value=intent):
             reply = handle_message("Move my call to tomorrow", _state(), cal)
-        cal.find_slots.assert_called_once()
+        assert cal.find_slots.call_count >= 1
         assert any(word in reply.lower() for word in ("no", "available", "window", "time"))
         cal.reschedule_booking.assert_not_called()
 
@@ -392,6 +474,54 @@ class TestRescheduleFlow:
         cal.find_slots.assert_called_once()
         _, kwargs = cal.find_slots.call_args
         assert kwargs.get("booking_uid_to_reschedule") == "uid-123"
+
+    def test_reschedule_source_time_and_target_day_are_not_confused(self) -> None:
+        ny = ZoneInfo("America/New_York")
+        local_now = datetime(2026, 6, 7, 22, 30, 0, tzinfo=ny)
+        source_start = datetime(2026, 6, 8, 13, 30, 0, tzinfo=ny)
+        source_end = source_start + timedelta(minutes=30)
+        target_start = datetime(2026, 6, 9, 13, 30, 0, tzinfo=ny)
+        target_end = target_start + timedelta(minutes=30)
+        intended_booking = _sample_booking(
+            uid="uid-tom-jack",
+            title="30 min meeting between Tianyi Ren and tom and jack",
+            start=source_start,
+            end=source_end,
+        )
+        wrong_tuesday_booking = _sample_booking(
+            uid="uid-taylor",
+            title="30 min meeting between Tianyi Ren and Taylor",
+            start=datetime(2026, 6, 9, 14, 0, 0, tzinfo=ny),
+            end=datetime(2026, 6, 9, 14, 30, 0, tzinfo=ny),
+        )
+        slot = Slot(start=target_start, end=target_end)
+        state = _state()
+        cal = _mock_cal()
+        cal.list_bookings.return_value = [intended_booking, wrong_tuesday_booking]
+        cal.find_slots.return_value = [slot]
+        cal.reschedule_booking.return_value = _sample_booking(
+            uid="uid-tom-jack",
+            title=intended_booking.title,
+            start=target_start,
+            end=target_end,
+        )
+
+        with (
+            patch("assistant._local_now", return_value=local_now),
+            patch("assistant.extract_intent") as mock_extract,
+        ):
+            reply1 = handle_message("move the meeting tomorrow at 1:30 to Tuesday", state, cal)
+            reply2 = handle_message("1", state, cal)
+            reply3 = handle_message("yes", state, cal)
+
+        mock_extract.assert_not_called()
+        assert "available slots" in reply1.lower()
+        assert "reschedule" in reply2.lower()
+        assert "Rescheduled" in reply3
+        find_kwargs = cal.find_slots.call_args.kwargs
+        assert find_kwargs["booking_uid_to_reschedule"] == "uid-tom-jack"
+        assert find_kwargs["start"] == target_start
+        cal.reschedule_booking.assert_called_once_with("uid-tom-jack", target_start)
 
 
 # ===========================================================================
@@ -562,6 +692,52 @@ class TestCornerCases:
         if state["pending_action"] is not None:
             assert state["pending_action"].action_type != "book"
 
+    def test_new_command_interrupts_open_slot_selection(self) -> None:
+        """A new intent while slots are open clears stale slot choices and handles the new request."""
+        state = _state()
+        state["pending_action"] = PendingAction(
+            action_type="book",
+            booking_draft=BookingDraft(
+                attendee_name="Jane",
+                attendee_email="jane@example.com",
+                duration_minutes=30,
+                timezone="UTC",
+                event_type_id=42,
+            ),
+        )
+        state["available_slots"] = [_sample_slot()]
+        cal = _mock_cal()
+        cal.list_bookings.return_value = [_sample_booking()]
+        intent = _intent(intent_type=IntentType.cancel, search_text="Jane")
+
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("Can you cancel my call with Jane?", state, cal)
+
+        assert state["available_slots"] == []
+        assert state["pending_action"].action_type == "cancel"
+        assert state["pending_action"].cancel_request is not None
+        assert "Cancel" in reply
+        cal.create_booking.assert_not_called()
+
+    def test_new_command_interrupts_multiple_match_selection(self) -> None:
+        state = _state()
+        state["pending_action"] = PendingAction(
+            action_type="cancel",
+            matching_bookings=[
+                _sample_booking(uid="uid-1", title="Call A"),
+                _sample_booking(uid="uid-2", title="Call B"),
+            ],
+        )
+        cal = _mock_cal()
+        cal.list_bookings.return_value = [_sample_booking(title="Existing Meeting")]
+        intent = _intent(intent_type=IntentType.list)
+
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("Actually, what's on my calendar?", state, cal)
+
+        assert "Existing Meeting" in reply
+        assert state["pending_action"] is None
+
     def test_yes_with_no_pending_asks_what_they_want(self) -> None:
         state = _state()  # pending_action is None
         cal = _mock_cal()
@@ -584,7 +760,7 @@ class TestCornerCases:
         # LLM interprets "cancel" as a cancel intent with no specific event
         cancel_intent = _intent(intent_type=IntentType.cancel)  # no search_text or uid
         with patch("assistant.extract_intent", return_value=cancel_intent):
-            reply = handle_message("cancel", state, cal)
+            handle_message("cancel", state, cal)
         assert state["pending_action"] is None
         cal.cancel_booking.assert_not_called()
 
@@ -698,7 +874,7 @@ class TestRescheduleSlotSelection:
         state["_reschedule_booking_uid"] = "uid-123"
         cal = _mock_cal()
         reply = handle_message("1", state, cal)
-        assert "yes" in reply.lower() or "no" in reply.lower()
+        assert "?" in reply
         assert state["pending_action"].reschedule_request is not None
         cal.reschedule_booking.assert_not_called()
 
@@ -712,7 +888,7 @@ class TestRescheduleSlotSelection:
         state["_reschedule_booking_uid"] = "uid-123"
         cal = _mock_cal()
         reply = handle_message("first", state, cal)
-        assert "yes" in reply.lower() or "no" in reply.lower()
+        assert "?" in reply
 
     def test_reschedule_invalid_slot_re_lists_options(self) -> None:
         state = _state()
@@ -723,7 +899,11 @@ class TestRescheduleSlotSelection:
         state["available_slots"] = [_sample_slot(_T2, _T3)]
         state["_reschedule_booking_uid"] = "uid-123"
         cal = _mock_cal()
-        reply = handle_message("banana", state, cal)
+        with patch(
+            "assistant.extract_intent",
+            return_value=_intent(intent_type=IntentType.unknown),
+        ):
+            reply = handle_message("banana", state, cal)
         assert "slot" in reply.lower() or "1." in reply or "Sep" in reply
         cal.reschedule_booking.assert_not_called()
 
@@ -744,7 +924,7 @@ class TestMultipleMatchSelection:
             matching_bookings=[booking1, booking2],
         )
         cal = _mock_cal()
-        reply = handle_message("1", state, cal)
+        handle_message("1", state, cal)
         assert state["pending_action"].cancel_request is not None
         assert state["pending_action"].cancel_request.booking_uid == "uid-1"
         cal.cancel_booking.assert_not_called()
@@ -774,7 +954,11 @@ class TestMultipleMatchSelection:
             matching_bookings=[booking1, booking2],
         )
         cal = _mock_cal()
-        reply = handle_message("banana", state, cal)
+        with patch(
+            "assistant.extract_intent",
+            return_value=_intent(intent_type=IntentType.unknown),
+        ):
+            reply = handle_message("banana", state, cal)
         assert "Call A" in reply or "Call B" in reply or "1" in reply or "2" in reply
         cal.cancel_booking.assert_not_called()
         assert len(state["pending_action"].matching_bookings) == 2
@@ -843,9 +1027,9 @@ class TestMultipleMatchSelection:
         assert kwargs.get("booking_uid_to_reschedule") == "uid-2"
         assert "slot" in reply2.lower() or "Sep" in reply2
 
-        # Turn 3: pick slot 1 (bypasses LLM) — asks yes/no
+        # Turn 3: pick slot 1 (bypasses LLM) — asks for confirmation
         reply3 = handle_message("1", state, cal)
-        assert "yes" in reply3.lower() or "no" in reply3.lower()
+        assert "?" in reply3
         rr = state["pending_action"].reschedule_request
         assert rr is not None
         assert rr.booking_uid == "uid-2"
@@ -968,6 +1152,42 @@ class TestErrorClassification:
         assert "slot" in reply.lower() or "available" in reply.lower() or "choose" in reply.lower()
         assert "confirmed" not in reply.lower()
 
+    def test_booking_slot_unavailable_offers_nearby_daypart_slots(self) -> None:
+        state = self._booking_pending_state()
+        nearby_slot = _sample_slot(
+            _T0 + timedelta(hours=1),
+            _T1 + timedelta(hours=1),
+        )
+        cal = _mock_cal()
+        cal.create_booking.side_effect = CalClientError(
+            "slot gone", 400, reason="slot_unavailable"
+        )
+        cal.find_slots.return_value = [nearby_slot]
+
+        reply = handle_message("yes", state, cal)
+
+        assert "nearby" in reply.lower()
+        assert state["available_slots"] == [nearby_slot]
+        assert state["pending_action"].booking_request is None
+
+    def test_booking_slot_unavailable_falls_back_to_same_day(self) -> None:
+        state = self._booking_pending_state()
+        same_day_slot = _sample_slot(
+            _T0 + timedelta(hours=3),
+            _T1 + timedelta(hours=3),
+        )
+        cal = _mock_cal()
+        cal.create_booking.side_effect = CalClientError(
+            "slot gone", 400, reason="slot_unavailable"
+        )
+        cal.find_slots.side_effect = [[], [same_day_slot]]
+
+        reply = handle_message("yes", state, cal)
+
+        assert "nearby" in reply.lower()
+        assert state["available_slots"] == [same_day_slot]
+        assert cal.find_slots.call_count == 2
+
     def test_cancel_timeout_shows_retry_message(self) -> None:
         cal = _mock_cal()
         cal.cancel_booking.side_effect = CalClientError("timed out", None, reason="timeout")
@@ -1015,3 +1235,424 @@ class TestTimePreferenceResolution:
             reply = handle_message("Move my Intro Call to later today", _state(), cal)
         cal.find_slots.assert_not_called()
         assert any(word in reply.lower() for word in ("specific", "date", "time", "day", "when", "reschedule"))
+
+
+# ===========================================================================
+# TestNoAvailabilityExplanation
+# ===========================================================================
+
+
+class TestNoAvailabilityExplanation:
+    def test_no_slots_after_all_fallbacks_returns_rules_message(self) -> None:
+        from assistant import _no_availability_message
+        cal = _mock_cal()
+        cal.find_slots.return_value = []
+        intent = _intent(
+            intent_type=IntentType.book,
+            attendee_name="Taylor",
+            attendee_email="taylor@example.com",
+            start_time=_T0,
+            end_time=_T1,
+            duration_minutes=30,
+            time_granularity="exact",
+        )
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("Book with Taylor at 2pm", _state(), cal)
+        expected = _no_availability_message()
+        assert reply == expected
+
+    def test_no_slots_for_reschedule_returns_rules_message(self) -> None:
+        from assistant import _no_availability_message
+        cal = _mock_cal()
+        cal.list_bookings.return_value = [_sample_booking()]
+        cal.find_slots.return_value = []
+        # _T0/_T1 match the sample booking's time so the time-window filter finds it.
+        # The cascade fires all fallback windows (all returning []) then yields the rules message.
+        intent = _intent(
+            intent_type=IntentType.reschedule,
+            search_text="Intro Call",
+            start_time=_T0,
+            end_time=_T1,
+        )
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("Move Intro Call to Monday", _state(), cal)
+        expected = _no_availability_message()
+        assert reply == expected
+
+    def test_no_slots_does_not_say_what_other_time(self) -> None:
+        cal = _mock_cal()
+        cal.find_slots.return_value = []
+        intent = _intent(
+            intent_type=IntentType.book,
+            attendee_name="Taylor",
+            attendee_email="taylor@example.com",
+            start_time=_T0,
+            end_time=_T1,
+            duration_minutes=30,
+            time_granularity="exact",
+        )
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("Book with Taylor at 2pm", _state(), cal)
+        assert "What other time" not in reply
+
+
+# ===========================================================================
+# TestSlotRefinement
+# ===========================================================================
+
+
+class TestSlotRefinement:
+    def _state_with_slots(self) -> dict:
+        draft = BookingDraft(
+            attendee_name="Taylor",
+            attendee_email="taylor@example.com",
+            duration_minutes=30,
+            start_time=_T0,
+            timezone="UTC",
+            event_type_id=42,
+        )
+        pending = PendingAction(action_type="book", booking_draft=draft)
+        return {
+            "messages": [],
+            "pending_action": pending,
+            "available_slots": [Slot(start=_T0, end=_T1)],
+        }
+
+    def test_date_refinement_during_slot_selection_reuses_draft(self) -> None:
+        state = self._state_with_slots()
+        new_start = _T2  # different date
+        new_slots = [Slot(start=new_start, end=_T3)]
+        cal = _mock_cal()
+        cal.find_slots.return_value = new_slots
+        intent = _intent(
+            intent_type=IntentType.book,
+            start_time=new_start,
+            time_granularity="date",
+        )
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("actually next Monday", state, cal)
+        # Draft name/email preserved; find_slots was called again
+        cal.find_slots.assert_called()
+        assert state["pending_action"].booking_draft.attendee_name == "Taylor"
+        assert state["pending_action"].booking_draft.attendee_email == "taylor@example.com"
+        assert "slot" in reply.lower() or "available" in reply.lower() or "select" in reply.lower()
+
+    def test_time_refinement_during_slot_selection(self) -> None:
+        state = self._state_with_slots()
+        new_start = datetime(2050, 9, 5, 15, 0, 0, tzinfo=timezone.utc)  # 3pm same day
+        cal = _mock_cal()
+        cal.find_slots.return_value = [Slot(start=new_start, end=new_start + timedelta(minutes=30))]
+        intent = _intent(
+            intent_type=IntentType.book,
+            start_time=new_start,
+            time_granularity="exact",
+        )
+        with patch("assistant.extract_intent", return_value=intent):
+            handle_message("actually 3pm", state, cal)
+        cal.find_slots.assert_called()
+        assert state["pending_action"].booking_draft.attendee_name == "Taylor"
+
+    def test_non_book_intent_during_slot_selection_clears_slots(self) -> None:
+        state = self._state_with_slots()
+        cal = _mock_cal()
+        cal.list_bookings.return_value = []
+        intent = _intent(intent_type=IntentType.list, start_time=_T0, end_time=_T1)
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("what's on my calendar?", state, cal)
+        assert state["available_slots"] == []
+        assert "coming up" in reply.lower() or "nothing" in reply.lower()
+
+
+# ===========================================================================
+# TestContextIsolation
+# ===========================================================================
+
+
+class TestContextIsolation:
+    """After confirm/decline, _new_task clears LLM history for the next call."""
+
+    def test_confirm_sets_new_task_and_next_turn_passes_empty_history(self) -> None:
+        state = _state()
+        state["messages"] = [
+            {"role": "user", "content": "reschedule my call"},
+            {"role": "assistant", "content": "Here are some slots"},
+            {"role": "user", "content": "1"},
+            {"role": "assistant", "content": "Confirm reschedule?"},
+        ]
+        state["pending_action"] = PendingAction(
+            action_type="reschedule",
+            reschedule_request=RescheduleRequest(booking_uid="uid-1", new_start_time=_T2),
+        )
+        cal = _mock_cal()
+        # Confirm — should set _new_task=True and clear pending_action
+        handle_message("yes", state, cal)
+        assert state.get("_new_task") is True
+        assert state["pending_action"] is None
+
+        # Next call — _new_task consumed; extract_intent should get empty history
+        captured: list[list] = []
+
+        def _capture_intent(text: str, history: list) -> UserIntent:
+            captured.append(list(history))
+            return UserIntent(intent_type=IntentType.list)
+
+        cal2 = _mock_cal()
+        cal2.list_bookings.return_value = []
+        with patch("assistant.extract_intent", side_effect=_capture_intent):
+            handle_message("list my meetings", state, cal2)
+
+        assert len(captured) == 1
+        assert captured[0] == []
+        assert not state.get("_new_task")
+
+    def test_decline_sets_new_task(self) -> None:
+        state = _state()
+        state["pending_action"] = PendingAction(
+            action_type="cancel",
+            cancel_request=CancelRequest(booking_uid="uid-1"),
+        )
+        cal = _mock_cal()
+        handle_message("no", state, cal)
+        assert state.get("_new_task") is True
+        assert state["pending_action"] is None
+
+    def test_new_task_consumed_after_one_turn(self) -> None:
+        state = _state()
+        state["pending_action"] = PendingAction(
+            action_type="book",
+            booking_request=BookingRequest(
+                attendee_name="Jane",
+                attendee_email="jane@example.com",
+                start_time=_T0,
+                duration_minutes=30,
+                timezone="UTC",
+                event_type_id=42,
+            ),
+        )
+        cal = _mock_cal()
+        handle_message("yes", state, cal)
+        assert state.get("_new_task") is True
+
+        cal2 = _mock_cal()
+        cal2.list_bookings.return_value = []
+        with patch("assistant.extract_intent", return_value=UserIntent(intent_type=IntentType.list)):
+            handle_message("list", state, cal2)
+
+        # _new_task should be consumed after this turn
+        assert not state.get("_new_task")
+
+    def test_yes_with_no_pending_consumes_new_task(self) -> None:
+        state = _state()
+        state["_new_task"] = True
+        cal = _mock_cal()
+        handle_message("yes", state, cal)
+        # _new_task must be consumed regardless of which branch fires
+        assert not state.get("_new_task")
+
+
+# ===========================================================================
+# TestTokenBasedMatching
+# ===========================================================================
+
+
+class TestTokenBasedMatching:
+    """Token-based cancel/reschedule search with full sentences, months, p.m., durations."""
+
+    NY = ZoneInfo("America/New_York")
+    _BOOKING_START = datetime(2026, 6, 9, 13, 30, 0, tzinfo=ZoneInfo("America/New_York"))
+    _BOOKING_END = datetime(2026, 6, 9, 14, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+
+    def _taylor_booking(self) -> Booking:
+        return _sample_booking(
+            uid="uid-taylor",
+            title="30 min meeting between Tianyi Ren and Taylor",
+            start=self._BOOKING_START,
+            end=self._BOOKING_END,
+            attendees=[Attendee(name="Taylor", email="taylor@example.com")],
+        )
+
+    def _local_now(self):
+        return datetime(2026, 6, 7, 10, 0, 0, tzinfo=self.NY)
+
+    def test_full_sentence_cancel_finds_taylor_booking(self) -> None:
+        """LLM returns search_text with full sentence; token matching finds the booking."""
+        cal = _mock_cal()
+        cal.list_bookings.return_value = [self._taylor_booking()]
+        state = _state()
+        # Simulate what the LLM would return for a full sentence cancel
+        intent = _intent(
+            intent_type=IntentType.cancel,
+            search_text="30 min meeting between Tianyi Ren and Taylor on Jun 9 1:30 PM EDT",
+            start_time=self._BOOKING_START,
+            end_time=self._BOOKING_END,
+            time_granularity="exact",
+        )
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message(
+                "cancel 30 min meeting between Tianyi Ren and Taylor on Jun 9, 1:30 PM EDT",
+                state,
+                cal,
+            )
+        # Tokens: ["tianyi", "ren", "taylor"] — all present in booking title
+        assert "not found" not in reply.lower() and "couldn't find" not in reply.lower()
+        assert state["pending_action"] is not None
+        assert state["pending_action"].cancel_request is not None
+        assert state["pending_action"].cancel_request.booking_uid == "uid-taylor"
+
+    def test_cancel_with_full_month_name_finds_booking(self) -> None:
+        """search_text with full month name 'June' is stripped correctly."""
+        cal = _mock_cal()
+        cal.list_bookings.return_value = [self._taylor_booking()]
+        state = _state()
+        intent = _intent(
+            intent_type=IntentType.cancel,
+            search_text="Taylor June 9 at 1:30 p.m.",
+            start_time=self._BOOKING_START,
+            end_time=self._BOOKING_END,
+            time_granularity="exact",
+        )
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("cancel Taylor June 9 at 1:30 p.m.", state, cal)
+        # Token "taylor" survives stripping; booking found
+        assert "not found" not in reply.lower() and "couldn't find" not in reply.lower()
+        assert state["pending_action"] is not None
+        assert state["pending_action"].cancel_request is not None
+
+    def test_cancel_with_duration_word_finds_booking(self) -> None:
+        """Duration words 'minute' are stripped so 'taylor' is the identifying token."""
+        cal = _mock_cal()
+        cal.list_bookings.return_value = [self._taylor_booking()]
+        state = _state()
+        intent = _intent(
+            intent_type=IntentType.cancel,
+            search_text="30 minute meeting with Taylor Jun 9 1:30 PM",
+            start_time=self._BOOKING_START,
+            end_time=self._BOOKING_END,
+            time_granularity="exact",
+        )
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("cancel 30 minute meeting with Taylor Jun 9 1:30 PM", state, cal)
+        assert "not found" not in reply.lower() and "couldn't find" not in reply.lower()
+        assert state["pending_action"] is not None
+
+    def test_only_generic_words_returns_all_bookings(self) -> None:
+        """When all tokens are stripped and no time filter, no text filter is applied."""
+        cal = _mock_cal()
+        cal.list_bookings.return_value = [self._taylor_booking()]
+        state = _state()
+        # search_text with all tokens stripped; no time filter → no text filter → all bookings
+        intent = _intent(intent_type=IntentType.cancel, search_text="meeting call")
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("cancel the meeting call", state, cal)
+        # With no effective filters, the single booking is returned → confirmation prompt
+        assert state["pending_action"] is not None
+
+    def test_failed_cancel_sets_last_failed_type(self) -> None:
+        cal = _mock_cal()
+        cal.list_bookings.return_value = []
+        state = _state()
+        intent = _intent(intent_type=IntentType.cancel, attendee_name="tom")
+        with patch("assistant.extract_intent", return_value=intent):
+            handle_message("cancel my meeting with tom", state, cal)
+        assert state.get("_last_failed_intent_type") == "cancel"
+
+    def test_failed_cancel_then_meeting_with_name_routes_to_cancel(self) -> None:
+        booking_tom = _sample_booking(
+            uid="uid-tom",
+            title="30 min meeting between Tianyi and Tom",
+            attendees=[Attendee(name="Tom", email="tom@example.com")],
+        )
+        cal = _mock_cal()
+        state = _state()
+
+        # Turn 1: cancel fails — no booking found with attendee_name="tom"
+        cal.list_bookings.return_value = []
+        intent1 = _intent(intent_type=IntentType.cancel, attendee_name="tom")
+        with patch("assistant.extract_intent", return_value=intent1):
+            reply1 = handle_message("cancel my meeting with tom", state, cal)
+        assert "not found" in reply1.lower() or "couldn't find" in reply1.lower()
+        assert state.get("_last_failed_intent_type") == "cancel"
+
+        # Turn 2: user says "meeting with tom" — should route to cancel handler
+        cal.list_bookings.return_value = [booking_tom]
+        reply2 = handle_message("meeting with tom", state, cal)
+        assert isinstance(reply2, str)
+        # Should find the booking and ask for confirmation
+        assert "not found" not in reply2.lower() and "couldn't find" not in reply2.lower()
+        assert state["pending_action"] is not None
+        assert state["pending_action"].cancel_request is not None
+        # _last_failed_intent_type consumed after one turn
+        assert not state.get("_last_failed_intent_type")
+
+    def test_last_failed_consumed_by_unrelated_command(self) -> None:
+        """_last_failed_intent_type does not affect unrelated next command."""
+        cal = _mock_cal()
+        state = _state()
+        state["_last_failed_intent_type"] = "cancel"
+        state["messages"] = []
+        cal.list_bookings.return_value = [_sample_booking(title="Intro Call")]
+        intent = _intent(intent_type=IntentType.list)
+        with patch("assistant.extract_intent", return_value=intent):
+            reply = handle_message("what's on my calendar?", state, cal)
+        assert "Intro Call" in reply
+        assert not state.get("_last_failed_intent_type")
+
+
+# ===========================================================================
+# TestListResultIsolation
+# ===========================================================================
+
+
+class TestListResultIsolation:
+    """list tomorrow/next week after a completed reschedule should not be contaminated."""
+
+    NY = ZoneInfo("America/New_York")
+
+    def _local_now_jun8(self):
+        return datetime(2026, 6, 8, 10, 0, 0, tzinfo=self.NY)
+
+    def test_list_tomorrow_after_reschedule_uses_fresh_list(self) -> None:
+        local_now = self._local_now_jun8()
+        jun8_booking = _sample_booking(
+            uid="uid-tom-jack",
+            title="30 min meeting between Tianyi Ren and tom and jack",
+            start=datetime(2026, 6, 8, 13, 30, 0, tzinfo=self.NY),
+            end=datetime(2026, 6, 8, 14, 0, 0, tzinfo=self.NY),
+        )
+        # Reschedule completed — state is clean with _new_task set
+        state = _state()
+        state["_new_task"] = True
+        state["messages"] = [
+            {"role": "user", "content": "reschedule tom jack meeting to Tuesday"},
+            {"role": "assistant", "content": "Rescheduled to Jun 9 1:30 PM EDT."},
+        ]
+
+        cal = _mock_cal()
+        cal.list_bookings.return_value = [jun8_booking]
+
+        with (
+            patch("assistant._local_now", return_value=local_now),
+            patch("assistant.extract_intent") as mock_extract,
+        ):
+            reply = handle_message("list tomorrow", state, cal)
+
+        mock_extract.assert_not_called()
+        # list_bookings should have been called for Jun 9 2026
+        kwargs = cal.list_bookings.call_args.kwargs
+        assert kwargs["start"].astimezone(self.NY).date().isoformat() == "2026-06-09"
+
+    def test_list_tomorrow_empty_calendar_after_reschedule(self) -> None:
+        local_now = self._local_now_jun8()
+        state = _state()
+        state["_new_task"] = True
+        cal = _mock_cal()
+        cal.list_bookings.return_value = []
+
+        with (
+            patch("assistant._local_now", return_value=local_now),
+            patch("assistant.extract_intent") as mock_extract,
+        ):
+            reply = handle_message("list tomorrow", state, cal)
+
+        mock_extract.assert_not_called()
+        assert any(word in reply.lower() for word in ("nothing", "no events", "empty", "scheduled"))

@@ -206,10 +206,14 @@ class CalClient:
             parse=_parse_booking_data,
         )
 
-    def cancel_booking(self, uid: str) -> None:
+    def cancel_booking(
+        self,
+        uid: str,
+        cancellation_reason: str = "User requested cancellation",
+    ) -> None:
         self._post(
             f"/bookings/{uid}/cancel",
-            body={},
+            body={"cancellationReason": cancellation_reason},
             version=_VERSION_BOOKINGS_WRITE,
             parse=lambda _: None,
         )

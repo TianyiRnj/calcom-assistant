@@ -66,7 +66,7 @@ Use these to test listing calendar events.
 | Step | User input/action                                                      | Expected response example                                                |
 | ---- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------ |
 | 1    | `Book a 30 minute call with Taylor at taylor@livex.ai tomorrow at 2pm` | `Here are some available slots - pick one above or reply with a number.` |
-| 2    | Click the first slot button, or type `1`                               | `Book with Taylor on Jun 12 at 2:00 PM UTC? Say yes or no.`              |
+| 2    | Click the first slot button, or type `1`                               | `Book with Taylor on Jun 12 at 2:00 PM UTC?`               |
 | 3    | `yes`                                                                  | `Done! '30 min meeting between ...' is booked for Jun 12, 2:00 PM UTC.`  |
 
 ### Missing Field Cases
@@ -87,8 +87,8 @@ Use these to test listing calendar events.
 
 | Case                           | User input/action              | Expected response example                                      |
 | ------------------------------ | ------------------------------ | -------------------------------------------------------------- |
-| Slot button                    | Click an available slot button | Confirmation prompt: `Book with Taylor on ...? Say yes or no.` |
-| Slot number                    | Type `1`                       | Confirmation prompt: `Book with Taylor on ...? Say yes or no.` |
+| Slot button                    | Click an available slot button | Confirmation prompt: `Book with Taylor on ...?` |
+| Slot number                    | Type `1`                       | Confirmation prompt: `Book with Taylor on ...?` |
 | Ordinal slot                   | Type `first`                   | Confirmation prompt for first slot.                            |
 | Invalid slot input             | Type `banana`                  | `Please reply with a number between 1 and 5 to select a slot.` |
 | Cancel while slots are showing | Type `cancel`                  | `Request cancelled. What would you like to do?`                |
@@ -120,7 +120,7 @@ Use these to test listing calendar events.
 
 | Step | User input/action            | Expected response example                                                      |
 | ---- | ---------------------------- | ------------------------------------------------------------------------------ |
-| 1    | `Cancel my call with Taylor` | `Cancel '30 min meeting between ...' on Jun 12 at 2:00 PM UTC? Say yes or no.` |
+| 1    | `Cancel my call with Taylor` | `Cancel '30 min meeting between ...' on Jun 12 at 2:00 PM UTC?` |
 | 2    | `yes`                        | `Booking cancelled.`                                                           |
 
 ### Cancel Cases
@@ -145,7 +145,7 @@ Use these to test listing calendar events.
 | Step | User input/action                        | Expected response example                                                  |
 | ---- | ---------------------------------------- | -------------------------------------------------------------------------- |
 | 1    | `Move my Taylor call to tomorrow at 3pm` | `Here are some available slots - pick one above or reply with a number.`   |
-| 2    | Click a slot button, or type `1`         | `Reschedule to Jun 12 at 3:00 PM UTC? Say yes or no.`                      |
+| 2    | Click a slot button, or type `1`         | `Reschedule to Jun 12 at 3:00 PM UTC?`                      |
 | 3    | `yes`                                    | `Rescheduled! '30 min meeting between ...' is now at Jun 12, 3:00 PM UTC.` |
 
 ### Reschedule Cases
@@ -167,8 +167,8 @@ Use these to test listing calendar events.
 
 | Case                        | User input/action              | Expected response example                                      |
 | --------------------------- | ------------------------------ | -------------------------------------------------------------- |
-| Slot button                 | Click an available slot button | `Reschedule to ...? Say yes or no.`                            |
-| Slot number                 | Type `1`                       | `Reschedule to ...? Say yes or no.`                            |
+| Slot button                 | Click an available slot button | `Reschedule to ...?`                            |
+| Slot number                 | Type `1`                       | `Reschedule to ...?`                            |
 | Invalid slot input          | Type `banana`                  | `Please reply with a number between 1 and 5 to select a slot.` |
 | Confirm reschedule          | `yes`                          | `Rescheduled! '...' is now at ...`                             |
 | Decline reschedule          | `no`                           | `Got it, no changes made.`                                     |

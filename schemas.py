@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 
@@ -85,11 +85,17 @@ class UserIntent(BaseModel):
     duration_minutes: Optional[int] = None
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
+    source_start_time: Optional[datetime] = None
+    source_end_time: Optional[datetime] = None
     timezone: Optional[str] = None
     booking_uid: Optional[str] = None
     time_preference: Optional[str] = None
+    # "date"=date only, "daypart"=date+daypart, "exact"=date+explicit time, "none"=no time info
+    time_granularity: Optional[Literal["none", "date", "daypart", "exact"]] = None
+    # day-level relative qualifier: "earlier" (8-11 AM), "mid" (11 AM-2 PM), "later" (2-6 PM)
+    relative_time_qualifier: Optional[Literal["earlier", "mid", "later"]] = None
 
-    @field_validator("start_time", "end_time", mode="after")
+    @field_validator("start_time", "end_time", "source_start_time", "source_end_time", mode="after")
     @classmethod
     def must_be_tz_aware(cls, v: datetime | None) -> datetime | None:
         return _require_tz_aware(v)
@@ -107,6 +113,7 @@ class BookingDraft(BaseModel):
     event_type_id: Optional[int] = None
     include_length_in_minutes: bool = False
     time_preference: Optional[str] = None
+    relative_time_qualifier: Optional[Literal["earlier", "mid", "later"]] = None
 
     @field_validator("start_time", "end_time", mode="after")
     @classmethod
@@ -173,6 +180,7 @@ class PendingAction(BaseModel):
     reschedule_request: Optional[RescheduleRequest] = None
     selected_slot: Optional[Slot] = None
     matching_bookings: list[Booking] = Field(default_factory=list)
+    waiting_for_field: Optional[str] = None  # "attendee_name" | "attendee_email"
 
 
 class CalClientError(Exception):

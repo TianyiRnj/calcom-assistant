@@ -6,11 +6,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import streamlit as st
+import streamlit as st  # noqa: E402
 
-from assistant import handle_message, _fmt_dt, _in_confirmation_phase
-from cal_client import CalClient, build_from_env
-from schemas import CalClientError, PendingAction, Slot
+from assistant import (  # noqa: E402
+    MAX_USER_MESSAGE_CHARS,
+    handle_message,
+    _format_display_dt,
+    _format_display_tz,
+    _format_slot_option,
+    _in_confirmation_phase,
+    _redact_potential_secrets,
+)
+from cal_client import CalClient, build_from_env  # noqa: E402
+from schemas import CalClientError, PendingAction, Slot  # noqa: E402
 
 _REQUIRED_ENV_VARS = (
     "CAL_API_KEY",
@@ -292,7 +300,11 @@ _STREAMLIT_CHROME_PATCH_HTML = """
   }
 
   patch();
-  const observer = new MutationObserver(patch);
+  let _rafId = null;
+  const observer = new MutationObserver(() => {
+    if (_rafId !== null) cancelAnimationFrame(_rafId);
+    _rafId = requestAnimationFrame(() => { _rafId = null; patch(); });
+  });
   observer.observe(parentDoc.body, { childList: true, subtree: true });
   setTimeout(patch, 250);
   setTimeout(patch, 1000);
@@ -338,21 +350,43 @@ def _dispatch_error_reply(exc: Exception) -> str:
 
 
 def _dispatch(user_text: str, cal_client: CalClient) -> None:
+    if not user_text.strip():
+        return
+    if len(user_text) > MAX_USER_MESSAGE_CHARS:
+        st.session_state["messages"].append(
+            {
+                "role": "assistant",
+                "content": "That message is a bit long — can you shorten it?",
+            }
+        )
+        return
+
+    clean_text = _redact_potential_secrets(user_text)
     _pending_snap = st.session_state.get("pending_action")
     _slots_snap = st.session_state.get("available_slots", [])
     try:
-        reply = handle_message(user_text, st.session_state, cal_client)
+        reply = handle_message(clean_text, st.session_state, cal_client)
     except Exception as exc:
         st.session_state["pending_action"] = _pending_snap
         st.session_state["available_slots"] = _slots_snap
         reply = _dispatch_error_reply(exc)
-    st.session_state["messages"].append({"role": "user", "content": user_text})
+    st.session_state["messages"].append({"role": "user", "content": clean_text})
     st.session_state["messages"].append({"role": "assistant", "content": reply})
 
 
 def main() -> None:
     st.set_page_config(page_title="Cal.com Assistant", page_icon="📅")
     _patch_streamlit_chrome()
+
+    # Inject padding every render pass so reruns don't remove it.
+    # This gives the last message room above the fixed chat-input bar.
+    st.markdown(
+        """<style>
+        section[data-testid="stMain"] > div:first-child { padding-bottom: 80px; }
+        </style>""",
+        unsafe_allow_html=True,
+    )
+
     st.title("Cal.com Scheduling Assistant")
 
     missing_env = _missing_required_env()
@@ -384,24 +418,86 @@ def main() -> None:
     if slots:
         st.markdown("**Available slots — click to select:**")
         for i, slot in enumerate(slots[:5]):
-            tz = slot.start.strftime("%Z") or ""
-            label = f"{i + 1}. {_fmt_dt(slot.start)} {tz}".strip()
+            label = _format_slot_option(i, slot)
             if st.button(label, key=f"slot_{i}"):
+                _dispatch(str(i + 1), cal_client)
+                st.rerun()
+
+    elif pending is not None and pending.matching_bookings:
+        st.markdown("**Matching bookings — click to select:**")
+        for i, booking in enumerate(pending.matching_bookings):
+            label = f"{i + 1}. {booking.title} — {_format_display_dt(booking.start)} {_format_display_tz(booking.start)}".strip()
+            if st.button(label, key=f"booking_{i}"):
                 _dispatch(str(i + 1), cal_client)
                 st.rerun()
 
     elif _in_confirmation_phase(pending):
         col1, col2 = st.columns(2)
-        if col1.button("Confirm", type="primary", key="btn_confirm"):
-            _dispatch("yes", cal_client)
-            st.rerun()
-        if col2.button("Decline", type="secondary", key="btn_decline"):
-            _dispatch("no", cal_client)
-            st.rerun()
+        with col1:
+            # Spacer + nested column pushes Confirm to the right edge of col1,
+            # near the center line.
+            _, confirm_col = st.columns([1, 0.5])
+            with confirm_col:
+                if st.button("Confirm", type="primary", key="btn_confirm"):
+                    _dispatch("yes", cal_client)
+                    st.rerun()
+        with col2:
+            if st.button("Decline", type="secondary", key="btn_decline"):
+                _dispatch("no", cal_client)
+                st.rerun()
 
-    if prompt := st.chat_input("What can I help you schedule?"):
-        _dispatch(prompt, cal_client)
-        st.rerun()
+    # Path A — chat input with optimistic rendering.
+    # User message and inline thinking indicator appear immediately in the same
+    # render pass; the assistant reply replaces the placeholder once ready.
+    if prompt := st.chat_input(
+        "What can I help you schedule?", max_chars=MAX_USER_MESSAGE_CHARS
+    ):
+        raw_text = prompt or ""
+        if raw_text.strip():
+            if len(raw_text) > MAX_USER_MESSAGE_CHARS:
+                st.session_state["messages"].append(
+                    {"role": "assistant", "content": "That message is a bit long — can you shorten it?"}
+                )
+                st.rerun()
+            else:
+                # Redact secrets before any storage or rendering
+                clean_text = _redact_potential_secrets(raw_text)
+
+                # 1. Append to display history immediately
+                st.session_state["messages"].append({"role": "user", "content": clean_text})
+
+                # 2. Render user bubble in this run (before rerun)
+                with st.chat_message("user"):
+                    st.markdown(clean_text)
+
+                # 3. Inline assistant placeholder
+                with st.chat_message("assistant"):
+                    placeholder = st.empty()
+                    placeholder.markdown("_Thinking…_")
+
+                    _pending_snap = st.session_state.get("pending_action")
+                    _slots_snap = st.session_state.get("available_slots", [])
+                    # Pass history without the just-appended user message so the
+                    # LLM does not see the current turn twice.
+                    history_for_llm = st.session_state["messages"][:-1]
+                    try:
+                        reply = handle_message(
+                            clean_text,
+                            st.session_state,
+                            cal_client,
+                            _history_override=history_for_llm,
+                        )
+                    except Exception as exc:
+                        st.session_state["pending_action"] = _pending_snap
+                        st.session_state["available_slots"] = _slots_snap
+                        reply = _dispatch_error_reply(exc)
+
+                    # 4. Replace placeholder with real reply
+                    placeholder.markdown(reply)
+
+                # 5. Persist assistant message and rerun to canonical state
+                st.session_state["messages"].append({"role": "assistant", "content": reply})
+                st.rerun()
 
 
 if __name__ == "__main__":

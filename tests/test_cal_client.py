@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -40,8 +40,6 @@ class TestListBookings:
                 timezone="UTC",
             )
             client.list_bookings()
-        _, kwargs = mock_cls.call_args
-        headers = kwargs.get("headers", mock_cls.call_args[0][1] if len(mock_cls.call_args[0]) > 1 else {})
         # Check via the actual call args
         all_args = mock_cls.call_args
         # headers is a keyword arg
@@ -357,6 +355,22 @@ class TestCancelBooking:
         _, kwargs = mock_http.post.call_args
         assert kwargs["headers"]["cal-api-version"] == "2026-02-25"
 
+    def test_cancel_sends_required_cancellation_reason(
+        self, cal_client: CalClient, mock_http: MagicMock
+    ) -> None:
+        mock_http.post.return_value = make_response(200, {})
+        cal_client.cancel_booking("uid-123")
+        _, kwargs = mock_http.post.call_args
+        assert kwargs["json"]["cancellationReason"] == "User requested cancellation"
+
+    def test_cancel_can_override_cancellation_reason(
+        self, cal_client: CalClient, mock_http: MagicMock
+    ) -> None:
+        mock_http.post.return_value = make_response(200, {})
+        cal_client.cancel_booking("uid-123", cancellation_reason="Need to move it")
+        _, kwargs = mock_http.post.call_args
+        assert kwargs["json"]["cancellationReason"] == "Need to move it"
+
 
 # ===========================================================================
 # TestRescheduleBooking
@@ -613,7 +627,7 @@ class TestPagination:
         page1 = self._page([booking_dict(uid="uid-1")], has_more=True, cursor="c1")
         page2 = self._page([booking_dict(uid="uid-2")], has_more=False)
         mock_http.get.side_effect = [make_response(200, page1), make_response(200, page2)]
-        result = cal_client.list_bookings()
+        cal_client.list_bookings()
         assert mock_http.get.call_count == 2
         # Second call must include the cursor
         _, kwargs2 = mock_http.get.call_args_list[1]
