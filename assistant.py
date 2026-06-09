@@ -17,6 +17,8 @@ from schemas import (
     CalClientError,
     CancelRequest,
     EventType,
+    ExtractedAttendee,
+    ExtractedIntent,
     IntentType,
     IntentValidationError,
     PendingAction,
@@ -91,6 +93,11 @@ _RELATIVE_DAY_WINDOWS: dict[str, tuple[int, int]] = {
     "later":   (14, 18),  # 2:00 PM – 6:00 PM
 }
 
+# Statuses excluded from list display (client-side filter applied after fetching)
+_LIST_EXCLUDED_STATUSES: frozenset[str] = frozenset({
+    "cancelled", "canceled", "rejected", "declined", "no_show", "noshow", "deleted",
+})
+
 # Words stripped from search text before token matching
 _TOKEN_STRIP_WORDS: frozenset[str] = frozenset(_GENERIC_BOOKING_SEARCH_WORDS) | frozenset({
     # action words
@@ -113,6 +120,8 @@ _TOKEN_STRIP_WORDS: frozenset[str] = frozenset(_GENERIC_BOOKING_SEARCH_WORDS) | 
 
 MAX_USER_MESSAGE_CHARS = 4000
 MAX_LLM_HISTORY_MESSAGES = 12
+# Number of semantic extraction retries after the initial attempt (env-configurable).
+LLM_EXTRACTION_MAX_RETRIES = int(os.environ.get("LLM_EXTRACTION_MAX_RETRIES", "2"))
 
 _WEEKDAY_INDEXES = {
     "monday": 0, "mon": 0,
@@ -187,6 +196,21 @@ def _check_impossible_date_in_intent(user_text: str, intent: "UserIntent") -> No
         raise IntentValidationError("Impossible date in booking request", reason="invalid_date")
 
 
+_ORDINAL_RE = re.compile(r'\b(\d+)(?:st|nd|rd|th)\b', re.IGNORECASE)
+_TRAILING_PUNCT_RE = re.compile(r'[!?]+\s*$')
+
+
+def _normalize_user_text(text: str) -> str:
+    """Strip ordinal suffixes and trailing !? before LLM extraction.
+
+    Preserves time markers ("3pm", "p.m.") and internal punctuation.
+    Applied only to the LLM user message; original text is kept for trust checks.
+    """
+    text = _ORDINAL_RE.sub(r'\1', text)
+    text = _TRAILING_PUNCT_RE.sub('', text).strip()
+    return text
+
+
 def _fmt_dt(dt: datetime, at: bool = False) -> str:
     sep = " at" if at else ","
     time = dt.strftime("%I:%M %p").lstrip("0")
@@ -194,61 +218,280 @@ def _fmt_dt(dt: datetime, at: bool = False) -> str:
 
 
 _INTENT_PROMPT_BASE = """\
-Extract the scheduling intent from the user's message and return JSON only.
+Extract the scheduling intent from the user's message. Return JSON only — no prose.
 
 Current date and time: {now_iso} (timezone: {default_tz})
 
-Required field: intent_type — one of: list, book, cancel, reschedule, unknown.
+Output a JSON object with these fields:
 
-Optional fields:
-- search_text: relevant names/keywords
-- attendee_name: person's name
-- attendee_email: the exact string the user gave as the attendee email — extract it \
-as-is even if it does not look like a valid email address (e.g. "not-an-email" or \
-"test" are still extracted; validation happens elsewhere)
-- duration_minutes: integer
-- start_time: ISO 8601 with timezone offset. Resolve ALL explicit date/time expressions \
-to concrete datetimes using the current date above — including past times like \
-"yesterday at 2pm" or "last Monday" (the application validates whether the time is in \
-the past; do not suppress it). Only set null when no specific day or time is mentioned \
-at all (e.g. "book a call with Jane" with zero time information).
-- end_time: ISO 8601 with timezone offset — search window end. If you set start_time, \
-also derive end_time based on the time-of-day preference (morning=08:00-12:00, \
-afternoon=12:00-17:00, evening=17:00-21:00, exact time=start+duration or +30min).
-For reschedule requests with both an original booking time and a target time, use \
-source_start_time/source_end_time for the original booking to find, and use \
-start_time/end_time for the target time to move it to. Example: "move the meeting \
-tomorrow at 1:30 to Tuesday" means source_start_time is tomorrow 1:30 and start_time \
-is Tuesday 1:30 unless the target gives a different time.
-For date-only list/cancel/reschedule requests like "tomorrow" or "next Tuesday", set \
-start_time to 00:00 local time for that date and end_time to 00:00 local time the next day.
-- source_start_time: ISO 8601 with timezone offset — for reschedule only, the original \
-booking time/date being moved.
-- source_end_time: ISO 8601 with timezone offset — for reschedule only, the original \
-booking search-window end.
-- timezone: IANA timezone string
-- booking_uid: booking UID if mentioned
-- time_preference: set ONLY when the time expression truly cannot be resolved to \
-a concrete start_time (e.g. "sometime next week" with no specific day)
-- time_granularity: how precise the time reference is — \
-"date" if only a date is mentioned (e.g. "next Monday", "tomorrow"), \
-"daypart" if a date and daypart are mentioned (e.g. "Monday afternoon", "tomorrow morning"), \
-"exact" if a specific time is mentioned (e.g. "Monday at 3pm", "tomorrow at 2:30"), \
-"none" if no time or date is mentioned at all. \
-Omit (null) only if the user message has no scheduling time content at all.
-- relative_time_qualifier: set to "earlier", "mid", or "later" ONLY for day-level \
-relative expressions such as "earlier today", "later tomorrow", "mid on Tuesday", \
-"around noon", "midday". Normalize: early→earlier, late→later, \
-middle/midday/noon/around noon→mid. Do NOT set this for week- or month-level \
-expressions ("later next week", "earlier this month"). Set to null otherwise.
+intent_type (required): one of "list", "book", "cancel", "reschedule", "unknown"
+
+attendees (list, default []): array of {{name, email}} objects, one per person mentioned.
+  - Extract every person mentioned. name and email are both optional per object.
+  - Do NOT collapse multiple people into one string like "tom and jack" — output separate objects.
+  - attendee name must be a person name only. Do NOT put date/time/timezone/event/action words
+    in attendee names (no "Taylor Jun 9", no "meeting", no "1:30 PM").
+
+event_name (string|null): event/title keywords only — e.g. "meeting", "Intro Call".
+  Must NOT contain dates, times, timezone words, or action words.
+
+search_text (string|null): fallback title/keyword search only.
+  Must NOT duplicate date/time text. Must NOT contain date/time/timezone words.
+
+booking_uid (string|null): booking UID if explicitly mentioned.
+
+source_start_time (ISO 8601 tz-aware|null): EXACT clock time of the EXISTING event.
+  Use ONLY when the user names a specific clock time: "the 3pm meeting", "my call at 10:30".
+  Resolve all date/time expressions to concrete datetimes using current date above.
+
+source_duration_minutes (int|null): duration of the original/source booking.
+  If source_start_time is set and no duration is given, default to 30.
+
+source_window_start (ISO 8601 tz-aware|null): broad range for LOCATING an existing event.
+  Use when the user gives a date or daypart — NOT an exact clock time: "on Friday",
+  "this morning", "June 12", "this week". Set to 00:00 local on the first day (or
+  daypart start hour). MUST pair with source_window_end. Never set both source_start_time
+  and source_window_start.
+
+source_window_end (ISO 8601 tz-aware|null): end of the existing-event search range.
+  Set to 00:00 local the day after the last day (or daypart end hour).
+  MUST pair with source_window_start.
+
+target_start_time (ISO 8601 tz-aware|null): EXACT desired new time for book/reschedule.
+  Use ONLY when the user gives a specific clock time: "book at 2pm", "reschedule to 9am Thursday".
+  Resolve all date/time expressions to concrete datetimes.
+
+target_duration_minutes (int|null): duration for the booking or reschedule target.
+  If target_start_time is set and no duration is given, default to source_duration_minutes or 30.
+
+target_window_start (ISO 8601 tz-aware|null): broad availability window for a NEW slot.
+  Use when the user gives a date or range — NOT an exact clock time: "next week",
+  "Tuesday", "June 15", "sometime this afternoon". Set to 00:00 local on the first day.
+  MUST pair with target_window_end. Never set both target_start_time and target_window_start.
+
+target_window_end (ISO 8601 tz-aware|null): end of the new-slot search window.
+  Set to 00:00 local the day after the last day.
+  MUST pair with target_window_start.
+
+date_range_start (ISO 8601 tz-aware|null): range start for list/agenda spans like "tomorrow"
+  or "next week". Set to 00:00 local time on the first day of the range.
+
+date_range_end (ISO 8601 tz-aware|null): range end. Must be set if and only if
+  date_range_start is set. Set to 00:00 local time on the day after the last day.
+
+relative_time_qualifier ("earlier"|"mid"|"later"|null): day-level only.
+  "earlier" for early/morning (~8-11 AM), "mid" for midday/noon (~11 AM-2 PM),
+  "later" for late/afternoon (~2-6 PM).
+  "later tomorrow" → set target_window_start to tomorrow AND relative_time_qualifier="later".
+  Do NOT set for week/month-level phrases ("later next week").
+
+timezone (IANA string|null): timezone if mentioned.
+
+Field separation rules:
+- source_start_time: exact clock time of the EXISTING event ("the 3pm meeting").
+- source_window_start/end: date or daypart range for FINDING the existing event ("on Friday").
+- target_start_time: exact requested NEW time ("book at 2pm", "reschedule to Thursday 9am").
+- target_window_start/end: date or range for the NEW slot search ("next week", "Tuesday", "June 15").
+- date_range_start/end: ONLY for list/agenda date ranges. Never for cancel/reschedule/book targets.
+- Do NOT set both the exact field and the window field for the same side.
+- Use duration (source_duration_minutes / target_duration_minutes), not end times.
+- Do NOT put dates/times/timezones in attendee names, event_name, or search_text.
+
+Examples:
+
+User: "cancel 30 min meeting with Taylor Jun 9 1:30 PM"
+Output:
+{{
+  "intent_type": "cancel",
+  "attendees": [{{"name": "Taylor", "email": null}}],
+  "event_name": "meeting",
+  "search_text": null,
+  "booking_uid": null,
+  "source_start_time": "{example_jun9_1330}",
+  "source_duration_minutes": 30,
+  "source_window_start": null,
+  "source_window_end": null,
+  "target_start_time": null,
+  "target_duration_minutes": null,
+  "target_window_start": null,
+  "target_window_end": null,
+  "date_range_start": null,
+  "date_range_end": null,
+  "relative_time_qualifier": null,
+  "timezone": "{default_tz}"
+}}
+
+User: "cancel meeting on friday"
+Output:
+{{
+  "intent_type": "cancel",
+  "attendees": [],
+  "event_name": "meeting",
+  "search_text": null,
+  "booking_uid": null,
+  "source_start_time": null,
+  "source_duration_minutes": null,
+  "source_window_start": "{example_friday_start}",
+  "source_window_end": "{example_saturday_start}",
+  "target_start_time": null,
+  "target_duration_minutes": null,
+  "target_window_start": null,
+  "target_window_end": null,
+  "date_range_start": null,
+  "date_range_end": null,
+  "relative_time_qualifier": null,
+  "timezone": "{default_tz}"
+}}
+
+User: "move meeting with tom and jack tomorrow at 1:30 to Tuesday"
+Output:
+{{
+  "intent_type": "reschedule",
+  "attendees": [{{"name": "tom", "email": null}}, {{"name": "jack", "email": null}}],
+  "event_name": "meeting",
+  "search_text": null,
+  "booking_uid": null,
+  "source_start_time": "{example_tomorrow_1330}",
+  "source_duration_minutes": 30,
+  "source_window_start": null,
+  "source_window_end": null,
+  "target_start_time": "{example_tuesday_1330}",
+  "target_duration_minutes": 30,
+  "target_window_start": null,
+  "target_window_end": null,
+  "date_range_start": null,
+  "date_range_end": null,
+  "relative_time_qualifier": null,
+  "timezone": "{default_tz}"
+}}
+
+User: "move meeting on June 12 to 15"
+Output:
+{{
+  "intent_type": "reschedule",
+  "attendees": [],
+  "event_name": "meeting",
+  "search_text": null,
+  "booking_uid": null,
+  "source_start_time": null,
+  "source_duration_minutes": null,
+  "source_window_start": "{example_jun12_start}",
+  "source_window_end": "{example_jun13_start}",
+  "target_start_time": null,
+  "target_duration_minutes": null,
+  "target_window_start": "{example_jun15_start}",
+  "target_window_end": "{example_jun16_start}",
+  "date_range_start": null,
+  "date_range_end": null,
+  "relative_time_qualifier": null,
+  "timezone": "{default_tz}"
+}}
+
+User: "book a call next week"
+Output:
+{{
+  "intent_type": "book",
+  "attendees": [],
+  "event_name": null,
+  "search_text": null,
+  "booking_uid": null,
+  "source_start_time": null,
+  "source_duration_minutes": null,
+  "source_window_start": null,
+  "source_window_end": null,
+  "target_start_time": null,
+  "target_duration_minutes": null,
+  "target_window_start": "{example_next_week_start}",
+  "target_window_end": "{example_next_week_end}",
+  "date_range_start": null,
+  "date_range_end": null,
+  "relative_time_qualifier": null,
+  "timezone": "{default_tz}"
+}}
+
+User: "what is on my calendar tomorrow"
+Output:
+{{
+  "intent_type": "list",
+  "attendees": [],
+  "event_name": null,
+  "search_text": null,
+  "booking_uid": null,
+  "source_start_time": null,
+  "source_duration_minutes": null,
+  "source_window_start": null,
+  "source_window_end": null,
+  "target_start_time": null,
+  "target_duration_minutes": null,
+  "target_window_start": null,
+  "target_window_end": null,
+  "date_range_start": "{example_tomorrow_start}",
+  "date_range_end": "{example_day_after_tomorrow_start}",
+  "relative_time_qualifier": null,
+  "timezone": "{default_tz}"
+}}
 
 Return ONLY valid JSON. No explanation."""
 
 
 def _build_intent_prompt(now: datetime, default_tz: str) -> str:
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    day_after = tomorrow + timedelta(days=1)
+    # Next Tuesday for reschedule example
+    days_to_tuesday = (1 - now.weekday()) % 7 or 7
+    tuesday = (now + timedelta(days=days_to_tuesday)).replace(
+        hour=13, minute=30, second=0, microsecond=0
+    )
+    # Jun 9 example (current year, or next if already past)
+    example_year = now.year
+    jun9 = now.replace(year=example_year, month=6, day=9, hour=13, minute=30, second=0, microsecond=0)
+    if jun9 < now:
+        jun9 = jun9.replace(year=example_year + 1)
+
+    tomorrow_1330 = tomorrow.replace(hour=13, minute=30)
+
+    # Next Friday for cancel-on-friday example
+    days_to_friday = (4 - now.weekday()) % 7 or 7
+    friday_start = (now + timedelta(days=days_to_friday)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    saturday_start = friday_start + timedelta(days=1)
+
+    # June 12/13/15/16 for reschedule window example (use next occurrence)
+    def _next_month_day(month: int, day: int) -> datetime:
+        d = now.replace(month=month, day=day, hour=0, minute=0, second=0, microsecond=0)
+        if d <= now:
+            d = d.replace(year=now.year + 1)
+        return d
+
+    jun12_start = _next_month_day(6, 12)
+    jun13_start = jun12_start + timedelta(days=1)
+    jun15_start = _next_month_day(6, 15)
+    jun16_start = jun15_start + timedelta(days=1)
+
+    # Next week (Monday–Sunday) for booking window example
+    days_to_monday = (7 - now.weekday()) % 7 or 7
+    next_week_start = (now + timedelta(days=days_to_monday)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    next_week_end = next_week_start + timedelta(days=7)
+
     return _INTENT_PROMPT_BASE.format(
         now_iso=now.isoformat(),
         default_tz=default_tz,
+        example_jun9_1330=jun9.isoformat(),
+        example_tomorrow_1330=tomorrow_1330.isoformat(),
+        example_tuesday_1330=tuesday.isoformat(),
+        example_tomorrow_start=tomorrow.isoformat(),
+        example_day_after_tomorrow_start=day_after.isoformat(),
+        example_friday_start=friday_start.isoformat(),
+        example_saturday_start=saturday_start.isoformat(),
+        example_jun12_start=jun12_start.isoformat(),
+        example_jun13_start=jun13_start.isoformat(),
+        example_jun15_start=jun15_start.isoformat(),
+        example_jun16_start=jun16_start.isoformat(),
+        example_next_week_start=next_week_start.isoformat(),
+        example_next_week_end=next_week_end.isoformat(),
     )
 
 
@@ -463,15 +706,74 @@ _CANCEL_WITH_PERSON_RE = re.compile(
 )
 
 
+# Tokens that indicate the start of a date/time after an attendee name.
+_DT_BOUNDARY_WORDS: frozenset[str] = frozenset({
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "january", "february", "march", "april", "june", "july", "august",
+    "september", "october", "november", "december",
+    "today", "tomorrow",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
+    "at",
+})
+# Regex to detect HH:MM or bare number+am/pm patterns.
+_DT_INLINE_RE = re.compile(r"\d{1,2}:\d{2}|\d{1,2}\s*[ap]m\b", re.IGNORECASE)
+
+
+def _split_name_from_datetime(tail: str) -> tuple[str, str]:
+    """Split 'Taylor Jun 9 1:30 PM' into ('Taylor', 'Jun 9 1:30 PM').
+
+    Scans tokens left-to-right; stops at the first date/time boundary word,
+    digit-colon pattern, or number-adjacent-to-month pattern.
+    Returns (name_part, datetime_part). Either part may be empty.
+    """
+    tokens = tail.split()
+    name_tokens: list[str] = []
+    for i, token in enumerate(tokens):
+        token_lower = token.lower().rstrip(".,")
+        # Stop at a recognised date/time boundary word.
+        if token_lower in _DT_BOUNDARY_WORDS:
+            return " ".join(name_tokens), " ".join(tokens[i:])
+        # Stop at an inline time pattern (e.g. "1:30" or "2pm").
+        if _DT_INLINE_RE.match(token):
+            return " ".join(name_tokens), " ".join(tokens[i:])
+        # Stop at a bare number (day number like "9" in "Jun 9").
+        if re.fullmatch(r"\d{1,2}", token):
+            return " ".join(name_tokens), " ".join(tokens[i:])
+        name_tokens.append(token)
+    return " ".join(name_tokens), ""
+
+
 def _deterministic_cancel_with_person(user_text: str) -> UserIntent | None:
-    """Deterministically parse 'cancel [my] <meeting|call> with <Name>'."""
+    """Deterministically parse 'cancel [my] <meeting|call> with <Name> [datetime]'.
+
+    Splits attendee name from any trailing date/time to avoid name contamination.
+    """
     m = _CANCEL_WITH_PERSON_RE.match(user_text.strip())
-    if m:
-        return UserIntent(
-            intent_type=IntentType.cancel,
-            attendee_name=m.group(1).strip(),
-        )
-    return None
+    if not m:
+        return None
+
+    tail = m.group(1).strip()
+    name_part, dt_part = _split_name_from_datetime(tail)
+    if not name_part:
+        # Could not isolate a name; fall through to LLM extraction.
+        return None
+
+    intent = UserIntent(
+        intent_type=IntentType.cancel,
+        attendee_name=name_part,
+    )
+
+    # If there is a datetime remainder, try to parse it as source_start_time.
+    if dt_part:
+        local_now = _local_now()
+        parsed = _datetime_from_text(dt_part, local_now=local_now)
+        if parsed is not None:
+            source_start, _ = parsed
+            intent.source_start_time = source_start
+            intent.source_end_time = source_start + timedelta(minutes=30)
+
+    return intent
 
 
 def _deterministic_cancel_intent(user_text: str) -> UserIntent | None:
@@ -505,6 +807,382 @@ def _deterministic_intent(
         _deterministic_reschedule_intent(user_text)
         or _deterministic_cancel_intent(user_text)
         or _deterministic_list_intent(user_text, allow_bare_date=allow_bare_date_list)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Structured extraction helpers (LLM → ExtractedIntent → UserIntent)
+# ---------------------------------------------------------------------------
+
+# Words that should never appear in attendee names, event_name, or search_text.
+_DATETIME_CONTAMINATION_WORDS: frozenset[str] = frozenset({
+    "today", "tomorrow",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "am", "pm", "edt", "est", "pst", "pdt", "cst", "cdt", "mst", "mdt", "utc", "gmt",
+})
+_ACTION_CONTAMINATION_WORDS: frozenset[str] = frozenset({
+    "cancel", "reschedule", "move", "book", "delete", "remove",
+    "meeting", "call", "appointment", "event",
+})
+# Regex patterns that indicate time-like content in attendee names.
+_TIME_PATTERN_RE = re.compile(r"\d{1,2}:\d{2}")
+_DIGIT_NEAR_MONTH_RE = re.compile(
+    r"\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
+    r"|january|february|march|april|june|july|august|september|october|november|december)\b"
+    r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
+    r"|january|february|march|april|june|july|august|september|october|november|december)"
+    r"\s+\d{1,2}\b",
+    re.IGNORECASE,
+)
+# Detects explicit time expressions in user text (for trust-check miss detection).
+_EXPLICIT_TIME_RE = re.compile(r"\d{1,2}:\d{2}|\d{1,2}\s*[ap]m\b", re.IGNORECASE)
+# Words that indicate date or time range context — used in trust-check Rule 5.
+_WINDOW_WORDS: frozenset[str] = frozenset({
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "week", "morning", "afternoon", "evening", "tonight", "tomorrow", "today",
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+})
+
+
+def _parse_and_validate_extraction(raw_text: str) -> ExtractedIntent:
+    """Parse raw LLM JSON output into a validated ExtractedIntent."""
+    try:
+        data = json.loads(raw_text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise AssistantError(
+            f"LLM returned invalid JSON: {exc}", reason="bad_json"
+        ) from exc
+    try:
+        return ExtractedIntent.model_validate(data)
+    except Exception as exc:
+        raise AssistantError(
+            f"LLM output failed schema validation: {exc}", reason="bad_json"
+        ) from exc
+
+
+def _trust_check(extracted: ExtractedIntent, user_text: str) -> tuple[bool, str]:
+    """Return (True, '') if extracted is trustworthy, else (False, reason).
+
+    Distinguishes Case 1 (LLM extraction failure) from Case 2 (user omitted info):
+    - Case 1 triggers a semantic retry.
+    - Case 2 is NOT a trust failure; missing fields will be asked via clarification.
+    """
+    # 1. Check attendee name cleanliness.
+    for attendee in extracted.attendees:
+        name = (attendee.name or "").strip()
+        if not name:
+            continue
+        name_lower = name.lower()
+        words = re.findall(r"[a-z]+", name_lower)
+        for word in words:
+            if word in _DATETIME_CONTAMINATION_WORDS or word in _ACTION_CONTAMINATION_WORDS:
+                return False, f"attendee name contains forbidden word: {word!r}"
+        if _TIME_PATTERN_RE.search(name):
+            return False, f"attendee name contains time-like pattern: {name!r}"
+        if _DIGIT_NEAR_MONTH_RE.search(name):
+            return False, f"attendee name contains digit near month: {name!r}"
+        if re.search(r"\band\b", name_lower):
+            return False, f"attendee name appears to collapse multiple people: {name!r}"
+
+    # 2. Check event_name and search_text cleanliness.
+    for field_name, field_val in (("event_name", extracted.event_name), ("search_text", extracted.search_text)):
+        if not field_val:
+            continue
+        words = re.findall(r"[a-z]+", field_val.lower())
+        for word in words:
+            if word in _DATETIME_CONTAMINATION_WORDS:
+                return False, f"{field_name} contains datetime word: {word!r}"
+
+    # 3. Extraction miss: user provided an explicit source time but LLM missed it.
+    # Only flag for cancel/reschedule. Only flag when there is exactly one time
+    # expression in user text — two times means source vs. target is ambiguous and we
+    # let the model decide.
+    if extracted.intent_type in (IntentType.cancel, IntentType.reschedule):
+        time_matches = _EXPLICIT_TIME_RE.findall(user_text)
+        if len(time_matches) == 1 and extracted.source_start_time is None and extracted.source_window_start is None:
+            # Single time could be source (cancel) or target (reschedule).
+            # For cancel, single time almost always means source.
+            if extracted.intent_type == IntentType.cancel:
+                return False, "user mentioned an exact time for cancel but source_start_time and source_window_start are both null"
+            # For reschedule, single time is likely the target — allow null source.
+
+    # 4. Extraction miss: user provided a target time for book/reschedule but LLM missed it.
+    if extracted.intent_type in (IntentType.book, IntentType.reschedule):
+        time_matches = _EXPLICIT_TIME_RE.findall(user_text)
+        if (time_matches
+                and extracted.target_start_time is None
+                and extracted.target_window_start is None
+                and extracted.date_range_start is None):
+            # Only flag if there are two or more times (one for source, one for target),
+            # or if this is a book intent (no source time concept).
+            if extracted.intent_type == IntentType.book and time_matches:
+                return (
+                    False,
+                    "user mentioned a time for booking but target_start_time, target_window_start, and date_range_start are all null",
+                )
+            if extracted.intent_type == IntentType.reschedule and len(time_matches) >= 2:
+                return (
+                    False,
+                    "user mentioned two times (source+target) but target_start_time and target_window_start are both null",
+                )
+
+    # 5. Dropped window: user text contains date/time words but no time field was extracted.
+    # Only fires when there are no explicit times — explicit-time cases are handled by Rules 3/4.
+    words_in_text = set(re.findall(r"[a-z]+", user_text.lower()))
+    has_window_words = bool(words_in_text & _WINDOW_WORDS)
+    if has_window_words:
+        explicit_times = _EXPLICIT_TIME_RE.findall(user_text)
+        if extracted.intent_type == IntentType.book and not explicit_times:
+            if (extracted.target_start_time is None
+                    and extracted.target_window_start is None
+                    and extracted.date_range_start is None):
+                return False, "book intent has date/window words but no time field extracted"
+        if extracted.intent_type in (IntentType.cancel, IntentType.reschedule) and not explicit_times:
+            if extracted.source_start_time is None and extracted.source_window_start is None:
+                return False, "cancel/reschedule intent has date/window words but no source field extracted"
+
+    return True, ""
+
+
+def _map_extracted_to_intent(extracted: ExtractedIntent) -> UserIntent:
+    """Map a validated ExtractedIntent to a UserIntent for downstream use.
+
+    Duration-to-window strategy: compute source_end_time and end_time here.
+    Does not call the LLM.
+    """
+    # Compute source_end_time from duration
+    source_end_time: datetime | None = None
+    if extracted.source_start_time is not None and extracted.source_duration_minutes is not None:
+        source_end_time = extracted.source_start_time + timedelta(
+            minutes=extracted.source_duration_minutes
+        )
+
+    # Compute target end_time from duration
+    target_end_time: datetime | None = None
+    if extracted.target_start_time is not None and extracted.target_duration_minutes is not None:
+        target_end_time = extracted.target_start_time + timedelta(
+            minutes=extracted.target_duration_minutes
+        )
+
+    # Map start_time / end_time and source times based on intent
+    is_list = extracted.intent_type == IntentType.list
+    is_reschedule = extracted.intent_type == IntentType.reschedule
+    is_cancel = extracted.intent_type == IntentType.cancel
+
+    if is_list:
+        # List: date_range maps to start_time/end_time
+        start_time = extracted.date_range_start
+        end_time = extracted.date_range_end
+        source_start = None
+        source_end = None
+    elif is_reschedule:
+        # Source side: exact clock time > broad window > date_range (only when date_range
+        # is not intended as the target, i.e. no relative_time_qualifier)
+        if extracted.source_start_time is not None:
+            source_start = extracted.source_start_time
+            source_end = source_end_time
+        elif extracted.source_window_start is not None:
+            source_start = extracted.source_window_start
+            source_end = extracted.source_window_end
+        elif (extracted.date_range_start is not None
+              and extracted.relative_time_qualifier is None
+              and extracted.target_window_start is None
+              and extracted.target_start_time is None):
+            source_start = extracted.date_range_start
+            source_end = extracted.date_range_end
+        else:
+            source_start = None
+            source_end = None
+        # Target side: exact clock time > broad window > date_range with qualifier
+        if extracted.target_start_time is not None:
+            start_time = extracted.target_start_time
+            end_time = target_end_time
+        elif extracted.target_window_start is not None:
+            start_time = extracted.target_window_start
+            end_time = extracted.target_window_end
+        elif extracted.date_range_start is not None and extracted.relative_time_qualifier is not None:
+            start_time = extracted.date_range_start
+            end_time = extracted.date_range_end
+        else:
+            start_time = None
+            end_time = None
+    elif is_cancel:
+        # Cancel: source time used for matching; no target time concept
+        start_time = None
+        end_time = None
+        if extracted.source_start_time is not None:
+            source_start = extracted.source_start_time
+            source_end = source_end_time
+        elif extracted.source_window_start is not None:
+            source_start = extracted.source_window_start
+            source_end = extracted.source_window_end
+        else:
+            source_start = extracted.date_range_start
+            source_end = extracted.date_range_end
+    else:
+        # Book: target maps to start_time/end_time; exact > window > date_range fallback
+        source_start = None
+        source_end = None
+        if extracted.target_start_time is not None:
+            start_time = extracted.target_start_time
+            end_time = target_end_time
+        elif extracted.target_window_start is not None:
+            start_time = extracted.target_window_start
+            end_time = extracted.target_window_end
+        elif extracted.date_range_start is not None:
+            start_time = extracted.date_range_start
+            end_time = extracted.date_range_end
+        else:
+            start_time = None
+            end_time = None
+
+    # event_name falls back to search_text if search_text is also null
+    event_name = extracted.event_name
+    search_text = extracted.search_text
+
+    # Infer time_granularity
+    if extracted.source_start_time is not None or extracted.target_start_time is not None:
+        time_granularity: str | None = "exact"
+    elif (extracted.source_window_start is not None
+          or extracted.target_window_start is not None
+          or extracted.date_range_start is not None):
+        time_granularity = "date"
+    else:
+        time_granularity = "none"
+
+    # Map multi-attendee list; drop blank entries; keep first attendee in scalar fields
+    attendees = [
+        a for a in extracted.attendees
+        if (a.name or "").strip() or (a.email or "").strip()
+    ]
+    attendee_name: str | None = None
+    attendee_email: str | None = None
+    if attendees:
+        attendee_name = (attendees[0].name or "").strip() or None
+        attendee_email = (attendees[0].email or "").strip() or None
+
+    return UserIntent(
+        intent_type=extracted.intent_type,
+        attendees=attendees,
+        event_name=event_name,
+        attendee_name=attendee_name,
+        attendee_email=attendee_email,
+        search_text=search_text,
+        duration_minutes=extracted.target_duration_minutes,
+        start_time=start_time,
+        end_time=end_time,
+        source_start_time=source_start,
+        source_end_time=source_end,
+        timezone=extracted.timezone,
+        booking_uid=extracted.booking_uid,
+        time_granularity=time_granularity,
+        relative_time_qualifier=extracted.relative_time_qualifier,
+    )
+
+
+_RETRY_CORRECTIVE_TEMPLATE = (
+    "The previous JSON was invalid or untrustworthy: {reason}. "
+    "Return corrected JSON only. "
+    "Separate attendees as an array of {{name, email}} objects — never collapse multiple "
+    "people into one name string. "
+    "Use source_start_time for exact known event times; use source_window_start/source_window_end "
+    "for date or daypart ranges like 'on Friday' or 'this morning'. "
+    "Use target_start_time for exact new booking times; use target_window_start/target_window_end "
+    "for date ranges like 'next week' or 'June 15'. "
+    "Use date_range_start/date_range_end only for list/agenda ranges. "
+    "Do not include dates/times/timezones in attendee names, event_name, or search_text."
+)
+
+
+def _call_llm_with_retry(
+    client: Any,
+    model: str,
+    prompt: str,
+    messages: list[dict],
+    user_text: str,
+) -> ExtractedIntent:
+    """Call the LLM, validate output, and retry semantically up to LLM_EXTRACTION_MAX_RETRIES times.
+
+    Type A retry (temperature rejection) is transparent and does not count against the limit.
+    Type B retry (bad JSON / validation / trust) counts against LLM_EXTRACTION_MAX_RETRIES.
+    """
+    max_semantic = LLM_EXTRACTION_MAX_RETRIES
+
+    def _one_call(request_messages: list[dict]) -> str:
+        """Single LLM call with temperature=0; retries once without temperature on rejection."""
+        kwargs: dict[str, Any] = dict(
+            model=model,
+            instructions=prompt,
+            input=_openai_messages(request_messages),
+            max_output_tokens=512,
+            temperature=0,
+            text={"format": {"type": "json_object"}, "verbosity": "low"},
+        )
+        try:
+            response = client.responses.create(**kwargs)
+            return _extract_response_text(response)
+        except Exception as exc:
+            msg = str(exc).lower()
+            # Type A: model does not support temperature — retry without it.
+            if "temperature" in msg or "unsupported" in msg or "invalid_request" in msg:
+                kwargs_no_temp = {k: v for k, v in kwargs.items() if k != "temperature"}
+                try:
+                    response = client.responses.create(**kwargs_no_temp)
+                    return _extract_response_text(response)
+                except Exception as exc2:
+                    raise AssistantError(f"LLM API error: {exc2}", reason="llm_failure") from exc2
+            raise AssistantError(f"LLM API error: {exc}", reason="llm_failure") from exc
+
+    # Initial attempt
+    bad_output: str = ""
+    reason: str = ""
+    try:
+        raw = _one_call(messages)
+        extracted = _parse_and_validate_extraction(raw)
+        trusted, reason = _trust_check(extracted, user_text)
+        if trusted:
+            return extracted
+        bad_output = raw
+    except AssistantError as exc:
+        # LLM API/network failures are not extraction quality issues — re-raise immediately.
+        if exc.reason == "llm_failure":
+            raise
+        bad_output = ""
+        reason = exc.message
+
+    # Semantic retries (Type B — extraction quality only)
+    retry_messages = list(messages)
+    for _ in range(max_semantic):
+        corrective = _RETRY_CORRECTIVE_TEMPLATE.format(reason=reason)
+        if bad_output:
+            retry_messages = retry_messages + [
+                {"role": "assistant", "content": bad_output},
+                {"role": "user", "content": corrective},
+            ]
+        else:
+            retry_messages = retry_messages + [{"role": "user", "content": corrective}]
+        try:
+            raw = _one_call(retry_messages)
+            extracted = _parse_and_validate_extraction(raw)
+            trusted, reason = _trust_check(extracted, user_text)
+            if trusted:
+                return extracted
+            bad_output = raw
+        except AssistantError as exc:
+            if exc.reason == "llm_failure":
+                raise
+            bad_output = ""
+            reason = exc.message
+
+    raise AssistantError(
+        f"LLM extraction untrustworthy after {max_semantic} retries: {reason}",
+        reason="bad_json",
     )
 
 
@@ -577,6 +1255,9 @@ def extract_intent(user_text: str, conversation_history: list[dict]) -> UserInte
         if message.get("role") in ("user", "assistant")
     ][-MAX_LLM_HISTORY_MESSAGES:]
 
+    # Normalize ordinals/trailing punctuation for the LLM; keep raw text for trust checks.
+    normalized_text = _normalize_user_text(user_text)
+
     messages = [
         {
             "role": "developer",
@@ -587,44 +1268,13 @@ def extract_intent(user_text: str, conversation_history: list[dict]) -> UserInte
             ),
         },
         *safe_history,
-        {"role": "user", "content": user_text},
+        {"role": "user", "content": normalized_text},
     ]
 
-    try:
-        response = client.responses.create(
-            model=model,
-            instructions=_build_intent_prompt(now, default_tz),
-            input=_openai_messages(messages),
-            max_output_tokens=512,
-            text={"format": {"type": "json_object"}, "verbosity": "low"},
-        )
-    except Exception as exc:
-        raise AssistantError(f"LLM API error: {exc}", reason="llm_failure") from exc
-
-    raw = _extract_response_text(response)
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise AssistantError(
-            f"LLM returned invalid JSON: {exc}", reason="bad_json"
-        ) from exc
-
-    if "intent_type" not in data:
-        raise AssistantError(
-            "LLM response missing intent_type field", reason="missing_field"
-        )
-
-    try:
-        return UserIntent(**data)
-    except Exception as exc:
-        raise IntentValidationError(
-            f"Invalid date or field in intent: {exc}", reason="invalid_date"
-        ) from exc
-
-
-_MEETING_WITH_FOLLOWUP_RE = re.compile(
-    r"^(?:meeting|call|appointment)\s+with\s+(.+)$", re.IGNORECASE
-)
+    extracted = _call_llm_with_retry(
+        client, model, _build_intent_prompt(now, default_tz), messages, user_text
+    )
+    return _map_extracted_to_intent(extracted)
 
 
 def handle_message(
@@ -636,27 +1286,11 @@ def handle_message(
     # Consume transient flags at the very top — before any early return — so they
     # cannot become stale across turns regardless of which branch fires.
     fresh_task = bool(session_state.pop("_new_task", False))
-    _last_failed = session_state.pop("_last_failed_intent_type", None)
 
     pending: Optional[PendingAction] = session_state.get("pending_action")
     available_slots: list[Slot] = session_state.get("available_slots", [])
     slot_selection_pending = False
     match_selection_pending = False
-
-    # --- One-turn follow-up for failed cancel/reschedule ---
-    # "meeting/call with X" after a no-match response continues the failed flow.
-    m = _MEETING_WITH_FOLLOWUP_RE.match(user_text.strip())
-    if m and _last_failed in ("cancel", "reschedule"):
-        followup_intent = UserIntent(
-            intent_type=IntentType.cancel if _last_failed == "cancel" else IntentType.reschedule,
-            attendee_name=m.group(1).strip(),
-        )
-        try:
-            if followup_intent.intent_type == IntentType.cancel:
-                return _handle_cancel(followup_intent, session_state, cal_client)
-            return _handle_reschedule(followup_intent, session_state, cal_client)
-        except CalClientError as exc:
-            return _format_cal_error(exc)
 
     # --- Pre-LLM impossible-date guard ---
     if _contains_impossible_date(user_text):
@@ -671,7 +1305,22 @@ def handle_message(
 
     # --- Confirmation phase: pending action waiting for yes/no ---
     if pending is not None and _in_confirmation_phase(pending):
-        return _handle_confirmation(user_text, pending, session_state, cal_client)
+        # "cancel the booking" during a cancel confirmation confirms the cancellation
+        if pending.cancel_request is not None and _is_cancel_booking_phrase(user_text):
+            return _handle_confirmation("yes", pending, session_state, cal_client)
+        if _is_affirmative(user_text) or _is_negative(user_text) or _is_cancel_word(user_text):
+            return _handle_confirmation(user_text, pending, session_state, cal_client)
+        if _looks_like_scheduling_command(user_text):
+            # User is starting a new command — discard old confirmation
+            _clear_pending_request(pending, session_state)
+            session_state["available_slots"] = []
+            _clear_reschedule_state(session_state)
+            session_state["pending_action"] = None
+            session_state["_new_task"] = True
+            pending = None
+            # Fall through to intent extraction
+        else:
+            return _handle_confirmation(user_text, pending, session_state, cal_client)
 
     # --- Slot selection phase: slots shown, pick one unless the user starts a new command ---
     if available_slots and pending is not None:
@@ -738,7 +1387,9 @@ def handle_message(
         raw = user_text.strip()
 
         if field == "attendee_email":
-            if "@" in raw:
+            if _looks_like_scheduling_command(raw):
+                pass  # fall through to LLM extraction
+            else:
                 if not _is_valid_email(raw):
                     return "That email doesn't look right. What's their email?"
                 pending.waiting_for_field = None
@@ -748,7 +1399,6 @@ def handle_message(
                     session_state,
                     cal_client,
                 )
-            # Not email-shaped: fall through to LLM
 
         elif field == "attendee_name":
             if _is_plain_name(raw):
@@ -761,32 +1411,36 @@ def handle_message(
                 )
             # Not plain name: fall through to LLM
 
+    # --- Deterministic pre-LLM abort: exact "cancel" during a booking or reschedule draft ---
+    if (
+        pending is not None
+        and pending.action_type in ("book", "reschedule")
+        and not available_slots
+        and not pending.matching_bookings
+        and not slot_selection_pending
+        and not match_selection_pending
+        and _is_cancel_word(user_text)
+    ):
+        session_state["pending_action"] = None
+        session_state["available_slots"] = []
+        _clear_reschedule_state(session_state)
+        session_state["_new_task"] = True
+        return "Request cancelled. What would you like to do?"
+
     # --- Intent extraction ---
-    deterministic = _deterministic_intent(
-        user_text,
-        allow_bare_date_list=(
-            pending is None
-            and not available_slots
-            and not slot_selection_pending
-            and not match_selection_pending
-        ),
-    )
-    if deterministic is not None:
-        intent = deterministic
-    else:
-        try:
-            if fresh_task:
-                history_for_llm: list[dict] = []
-            elif _history_override is not None:
-                history_for_llm = _history_override
-            else:
-                history_for_llm = session_state.get("messages", [])
-            intent = extract_intent(user_text, history_for_llm)
-            _check_impossible_date_in_intent(user_text, intent)
-        except AssistantError as exc:
-            return _handle_assistant_error(exc)
-        except IntentValidationError as exc:
-            return _handle_validation_error(exc)
+    try:
+        if fresh_task:
+            history_for_llm: list[dict] = []
+        elif _history_override is not None:
+            history_for_llm = _history_override
+        else:
+            history_for_llm = session_state.get("messages", [])
+        intent = extract_intent(user_text, history_for_llm)
+        _check_impossible_date_in_intent(user_text, intent)
+    except AssistantError as exc:
+        return _handle_assistant_error(exc)
+    except IntentValidationError as exc:
+        return _handle_validation_error(exc)
 
     # --- Slot refinement: user updated date/time while slots were showing ---
     if (
@@ -809,7 +1463,11 @@ def handle_message(
         ):
             # Same action type — user is still disambiguating; re-show the list.
             return (
-                _multiple_matches_text(pending.matching_bookings, pending.action_type)
+                _multiple_matches_text(
+                    pending.matching_bookings,
+                    pending.action_type,
+                    partial=pending.matching_bookings_are_partial,
+                )
                 + "\n\nPlease reply with a number to select one."
             )
         session_state["pending_action"] = None
@@ -820,21 +1478,13 @@ def handle_message(
         return f"Please reply with a number between 1 and {len(available_slots)} to select a slot."
     elif match_selection_pending and pending is not None:
         return (
-            _multiple_matches_text(pending.matching_bookings, pending.action_type)
+            _multiple_matches_text(
+                pending.matching_bookings,
+                pending.action_type,
+                partial=pending.matching_bookings_are_partial,
+            )
             + "\n\nPlease reply with a number."
         )
-
-    # --- "cancel" keyword during booking draft collection ---
-    if (
-        pending is not None
-        and pending.action_type == "book"
-        and intent.intent_type == IntentType.cancel
-        and not intent.search_text
-        and not intent.booking_uid
-    ):
-        session_state["pending_action"] = None
-        session_state["_new_task"] = True
-        return "Booking request cancelled. What would you like to do?"
 
     # --- Intent switch resets unrelated pending action ---
     if pending is not None and pending.action_type != intent.intent_type.value:
@@ -854,8 +1504,13 @@ def handle_message(
         elif intent.intent_type == IntentType.reschedule:
             return _handle_reschedule(intent, session_state, cal_client)
         else:
+            normalized = user_text.strip().lower()
+            if re.search(r"\b(move|reschedule)\b", normalized):
+                return "Which meeting should I move, and when should it move to?"
+            if re.search(r"\bcancel\b", normalized):
+                return "Which meeting would you like to cancel?"
             return (
-                "I can only help with scheduling — booking, canceling, or rescheduling events."
+                "I can only help with scheduling — listing, booking, canceling, or rescheduling events."
             )
     except CalClientError as exc:
         return _format_cal_error(exc)
@@ -871,7 +1526,18 @@ def handle_message(
 def _handle_list(
     intent: UserIntent, session_state: dict, cal_client: CalClient
 ) -> str:
-    bookings = cal_client.list_bookings(start=intent.start_time, end=intent.end_time)
+    # Date-bounded queries use status=None so past events in the window are included.
+    # Unbounded queries keep status="upcoming" to avoid overwhelming the response.
+    if intent.start_time is not None or intent.end_time is not None:
+        bookings = cal_client.list_bookings(
+            start=intent.start_time, end=intent.end_time, status=None
+        )
+        bookings = [
+            b for b in bookings
+            if (b.status or "").strip().lower() not in _LIST_EXCLUDED_STATUSES
+        ]
+    else:
+        bookings = cal_client.list_bookings(start=intent.start_time, end=intent.end_time)
     if not bookings:
         return "You have nothing scheduled for that period."
     items = []
@@ -880,13 +1546,40 @@ def _handle_list(
     return "Here's what's coming up:\n\n" + "\n".join(items)
 
 
+def _booking_day_hint(start: datetime, end: datetime) -> str:
+    """Return a brief context phrase for multi-day booking windows, e.g. ' next week'."""
+    span_days = (end - start).days
+    if span_days >= 7:
+        return " next week"
+    return ""
+
+
 def _handle_book(
     intent: UserIntent, session_state: dict, cal_client: CalClient
 ) -> str:
     pending: Optional[PendingAction] = session_state.get("pending_action")
 
-    # Merge into existing draft or create new one
+    # Determine whether this is a new request (start fresh) or a refinement (merge).
+    # Contradiction = draft already has an attendee field AND new value differs from it.
+    # Providing a previously-None field or changing the date/time is always a refinement.
+    is_new_request = False
     if pending and pending.action_type == "book" and pending.booking_draft is not None:
+        draft = pending.booking_draft
+        if (
+            intent.attendee_name is not None
+            and draft.attendee_name is not None
+            and intent.attendee_name.lower() != draft.attendee_name.lower()
+        ):
+            is_new_request = True
+        if (
+            not is_new_request
+            and intent.attendee_email is not None
+            and draft.attendee_email is not None
+            and intent.attendee_email.lower() != draft.attendee_email.lower()
+        ):
+            is_new_request = True
+
+    if pending and pending.action_type == "book" and pending.booking_draft is not None and not is_new_request:
         draft = pending.booking_draft
         # Date-only follow-up: preserve prior hour/minute before merging new date
         if (
@@ -896,6 +1589,32 @@ def _handle_book(
         ):
             prior_start = draft.start_time  # snapshot BEFORE merge
             _preserve_draft_time_in_intent(intent, prior_start)
+
+        # Combine stored date + new time: draft has a date-only window (midnight) and
+        # the user just provided a clock time without an explicit future date.
+        default_tz = os.environ.get("CAL_TIMEZONE", "America/New_York")
+        if (
+            draft.time_granularity == "date"
+            and draft.start_time is not None
+            and intent.start_time is not None
+            and intent.time_granularity == "exact"
+        ):
+            local_tz = ZoneInfo(draft.timezone or default_tz)
+            today_local = datetime.now(local_tz).date()
+            intent_local_date = intent.start_time.astimezone(local_tz).date()
+            draft_local_date = draft.start_time.astimezone(local_tz).date()
+            if intent_local_date == today_local and draft_local_date > today_local:
+                intent_local = intent.start_time.astimezone(local_tz)
+                new_start = draft.start_time.astimezone(local_tz).replace(
+                    hour=intent_local.hour,
+                    minute=intent_local.minute,
+                    second=0,
+                    microsecond=0,
+                )
+                intent.start_time = new_start
+                intent.end_time = None
+                intent.time_granularity = "exact"
+
         _merge_intent_into_draft(draft, intent)
     else:
         default_tz = os.environ.get("CAL_TIMEZONE", "America/New_York")
@@ -908,22 +1627,29 @@ def _handle_book(
             timezone=intent.timezone or default_tz,
             time_preference=intent.time_preference,
             relative_time_qualifier=intent.relative_time_qualifier,
+            time_granularity=intent.time_granularity,
         )
         pending = PendingAction(action_type="book", booking_draft=draft)
         session_state["pending_action"] = pending
+        session_state["available_slots"] = []
 
     # Validate email if present
     if draft.attendee_email and not _is_valid_email(draft.attendee_email):
         raise IntentValidationError("Invalid email address", reason="invalid_email")
 
-    # Validate start_time not in the past
+    # Validate start_time not in the past (skip date-only ranges — Cal.com will return no slots)
     if draft.start_time is not None:
-        now = datetime.now(tz=draft.start_time.tzinfo)
-        if draft.start_time < now:
-            draft.start_time = None  # clear so next message doesn't re-trigger this
-            raise IntentValidationError(
-                "Requested time is in the past", reason="past_date"
-            )
+        is_date_only_range = (
+            draft.end_time is not None
+            and (draft.end_time - draft.start_time) >= timedelta(days=1)
+        )
+        if not is_date_only_range:
+            now = datetime.now(tz=draft.start_time.tzinfo)
+            if draft.start_time < now:
+                draft.start_time = None
+                raise IntentValidationError(
+                    "Requested time is in the past", reason="past_date"
+                )
 
     # Ask for next missing field (name, email, or time)
     missing = draft.missing_fields()
@@ -932,6 +1658,13 @@ def _handle_book(
         if field in ("attendee_name", "attendee_email"):
             pending.waiting_for_field = field
             session_state["pending_action"] = pending
+        if field == "time":
+            if draft.start_time is not None and draft.time_granularity == "date":
+                date_label = _format_display_dt(draft.start_time).split(" at")[0]
+                return f"What time on {date_label} works?"
+            if draft.start_time is not None:
+                return "What time works?"
+            return "Which day and time works? For example, 'Monday at 2pm'."
         return _ask_for_field(field)
 
     # Field was provided; clear waiting state
@@ -940,7 +1673,16 @@ def _handle_book(
 
     # All structural fields present — but we need a concrete start_time before fetching slots
     if draft.start_time is None:
-        return "What specific date and time works? For example, 'Thursday at 2pm'."
+        return "Which day and time works? For example, 'Thursday at 2pm'."
+
+    # Multi-day window: ask user to pick a specific day before fetching slots
+    if (
+        draft.end_time is not None
+        and (draft.end_time - draft.start_time) > timedelta(days=1)
+    ):
+        session_state["pending_action"] = pending
+        hint = _booking_day_hint(draft.start_time, draft.end_time)
+        return f"Which day{hint} works? For example, 'Monday' or 'June 15'."
 
     event_type_prompt = _ensure_booking_event_type(draft, cal_client)
     if event_type_prompt is not None:
@@ -954,28 +1696,35 @@ def _handle_cancel(
     intent: UserIntent, session_state: dict, cal_client: CalClient
 ) -> str:
     upcoming = cal_client.list_bookings(status="upcoming")
-    matches = _filter_bookings(upcoming, intent)
+    candidates, is_loose = _tiered_match_bookings(upcoming, intent)
 
-    if not matches:
-        # Check if the booking exists but is already cancelled
-        cancelled_bookings = cal_client.list_bookings(status="cancelled")
-        if _filter_bookings(cancelled_bookings, intent):
-            return "That booking is already cancelled."
-        session_state["_last_failed_intent_type"] = "cancel"
+    if not candidates:
+        past = _check_past_booking(intent, cal_client)
+        if past:
+            return "That meeting already took place and can't be cancelled."
         return "I couldn't find a matching booking."
 
-    if len(matches) > 1:
-        pending = PendingAction(action_type="cancel", matching_bookings=matches)
+    if len(candidates) == 1 and not is_loose:
+        booking = candidates[0]
+        pending = PendingAction(
+            action_type="cancel",
+            cancel_request=CancelRequest(
+                booking_uid=booking.uid,
+                booking_title=booking.title,
+                booking_start=booking.start,
+                booking_end=booking.end,
+            ),
+        )
         session_state["pending_action"] = pending
-        return _multiple_matches_text(matches, "cancel")
+        return _cancel_confirmation_text(booking)
 
-    booking = matches[0]
     pending = PendingAction(
         action_type="cancel",
-        cancel_request=CancelRequest(booking_uid=booking.uid),
+        matching_bookings=candidates,
+        matching_bookings_are_partial=is_loose,
     )
     session_state["pending_action"] = pending
-    return _cancel_confirmation_text(booking)
+    return _multiple_matches_text(candidates, "cancel", partial=is_loose)
 
 
 def _handle_reschedule(
@@ -1003,24 +1752,26 @@ def _handle_reschedule(
 
     if upcoming is None:
         upcoming = cal_client.list_bookings(status="upcoming")
-    matches = _filter_bookings(upcoming, intent)
+    candidates, is_loose = _tiered_match_bookings(upcoming, intent)
 
-    if not matches:
-        # Check if the booking exists but is already cancelled
-        cancelled_bookings = cal_client.list_bookings(status="cancelled")
-        if _filter_bookings(cancelled_bookings, intent):
-            return "That booking is already cancelled and can't be rescheduled."
-        session_state["_last_failed_intent_type"] = "reschedule"
+    if not candidates:
+        past = _check_past_booking(intent, cal_client)
+        if past:
+            return "That meeting already took place and can't be rescheduled."
         return "I couldn't find a matching booking. Could you provide more details?"
 
-    if len(matches) > 1:
-        pending = PendingAction(action_type="reschedule", matching_bookings=matches)
-        session_state["pending_action"] = pending
-        session_state["_reschedule_original_intent"] = intent
-        return _multiple_matches_text(matches, "reschedule")
+    if len(candidates) == 1 and not is_loose:
+        booking = candidates[0]
+        return _fetch_reschedule_slots(booking, intent, session_state, cal_client)
 
-    booking = matches[0]
-    return _fetch_reschedule_slots(booking, intent, session_state, cal_client)
+    pending = PendingAction(
+        action_type="reschedule",
+        matching_bookings=candidates,
+        matching_bookings_are_partial=is_loose,
+    )
+    session_state["pending_action"] = pending
+    session_state["_reschedule_original_intent"] = intent
+    return _multiple_matches_text(candidates, "reschedule", partial=is_loose)
 
 
 # ---------------------------------------------------------------------------
@@ -1086,6 +1837,7 @@ def _handle_confirmation(
             return _format_cal_error(exc)
     elif _is_negative(user_text) or _is_cancel_word(user_text):
         session_state["pending_action"] = None
+        session_state["available_slots"] = []
         _clear_reschedule_state(session_state)
         session_state["_new_task"] = True
         return "Got it, no changes made."
@@ -1099,6 +1851,7 @@ def _execute_confirmed_action(
     if pending.booking_request is not None:
         booking = cal_client.create_booking(pending.booking_request)
         session_state["pending_action"] = None
+        session_state["available_slots"] = []
         session_state["_new_task"] = True
         return (
             f"Done! '{booking.title}' is booked for "
@@ -1106,8 +1859,31 @@ def _execute_confirmed_action(
         ).strip()
 
     if pending.cancel_request is not None:
-        cal_client.cancel_booking(pending.cancel_request.booking_uid)
+        req = pending.cancel_request
+        uid = req.booking_uid
+        _NON_CANCELLABLE = frozenset({"cancelled", "canceled", "rejected", "declined", "deleted"})
+        try:
+            margin = timedelta(hours=1)
+            if req.booking_start is not None and req.booking_end is not None:
+                candidates = cal_client.list_bookings(
+                    status=None,
+                    start=req.booking_start - margin,
+                    end=req.booking_end + margin,
+                )
+            else:
+                candidates = cal_client.list_bookings(status="upcoming")
+        except CalClientError:
+            session_state["pending_action"] = None
+            session_state["_new_task"] = True
+            return "Could not verify the booking status. Please try again."
+        match = next((b for b in candidates if b.uid == uid), None)
+        if match is None or match.status.lower() in _NON_CANCELLABLE:
+            session_state["pending_action"] = None
+            session_state["_new_task"] = True
+            return "That booking is already cancelled or no longer upcoming, so I didn't make any changes."
+        cal_client.cancel_booking(uid)
         session_state["pending_action"] = None
+        session_state["available_slots"] = []
         session_state["_new_task"] = True
         return "Booking cancelled."
 
@@ -1117,6 +1893,7 @@ def _execute_confirmed_action(
             pending.reschedule_request.new_start_time,
         )
         session_state["pending_action"] = None
+        session_state["available_slots"] = []
         _clear_reschedule_state(session_state)
         session_state["_new_task"] = True
         return (
@@ -1230,8 +2007,9 @@ def _handle_slot_selection(
     duration = draft.duration_minutes or 30
     slot_line = _format_slot_option(idx, slot)
     return (
-        f"You selected:\n  {slot_line}\n"
-        f"Book a {duration}-minute call with {request.attendee_name} at this time?"
+        f"You selected:\n  {slot_line}\n\n"
+        f"Book a {duration}-minute call with {request.attendee_name}?\n"
+        f"Email: {request.attendee_email}"
     )
 
 
@@ -1700,6 +2478,13 @@ def _fetch_reschedule_slots(
     if intent.start_time is None:
         return "What specific day and time would you like to reschedule to?"
 
+    # No-op guard: target start overlaps the original booking window
+    orig_s_utc = booking.start.astimezone(timezone.utc)
+    orig_e_utc = booking.end.astimezone(timezone.utc)
+    target_utc = intent.start_time.astimezone(timezone.utc)
+    if orig_s_utc <= target_utc < orig_e_utc:
+        return "That booking is already at that time. What time would you like to move it to?"
+
     default_tz = os.environ.get("CAL_TIMEZONE", "America/New_York")
     tz = intent.timezone or default_tz
     qualifier = intent.relative_time_qualifier
@@ -1731,6 +2516,13 @@ def _fetch_reschedule_slots(
         event_type_id=event_type_id,
     )
 
+    # Filter slots that overlap the original booking window
+    slots = [
+        s for s in slots
+        if not (s.start.astimezone(timezone.utc) < orig_e_utc
+                and s.end.astimezone(timezone.utc) > orig_s_utc)
+    ]
+
     if slots and qualifier:
         try:
             local_tz = ZoneInfo(tz)
@@ -1746,16 +2538,7 @@ def _fetch_reschedule_slots(
         )
         if used_fallback:
             qualifier_label = {"earlier": "earlier", "mid": "mid-day", "later": "later"}[qualifier]
-            # Store reschedule context and show fallback slots
-            draft = BookingDraft(
-                attendee_name=booking.attendees[0].name if booking.attendees else None,
-                event_type_id=event_type_id,
-                timezone=tz,
-            )
-            pending = PendingAction(action_type="reschedule", booking_draft=draft)
-            session_state["pending_action"] = pending
-            session_state["_reschedule_booking_uid"] = booking.uid
-            session_state["available_slots"] = slots[:_DISPLAY_LIMIT]
+            _setup_reschedule_state(session_state, booking, event_type_id, tz, slots[:_DISPLAY_LIMIT])
             return (
                 f"I couldn't find {qualifier_label} slots in that window, but here are "
                 f"the closest available times that day — pick one above or reply with a number."
@@ -1772,31 +2555,16 @@ def _fetch_reschedule_slots(
             time_preference=intent.time_preference,
             already_tried=(query_start, query_end),
         )
-        session_state["_reschedule_booking_uid"] = booking.uid
-        session_state["pending_action"] = PendingAction(action_type="reschedule")
+        fallback_slots = [s for s in fallback_slots if not _slot_overlaps_booking(s, booking)]
+        _setup_reschedule_state(session_state, booking, event_type_id, tz, fallback_slots[:_DISPLAY_LIMIT])
         if fallback_slots:
-            session_state["available_slots"] = fallback_slots[:_DISPLAY_LIMIT]
             return (
                 f"The exact time wasn't available, but here are nearby options "
                 f"{label} — pick one above or reply with a number."
             )
         return _no_availability_message()
 
-    # Store the booking we're rescheduling in a temporary draft
-    draft = BookingDraft(
-        attendee_name=booking.attendees[0].name if booking.attendees else None,
-        event_type_id=event_type_id,
-        timezone=tz,
-    )
-    pending = PendingAction(
-        action_type="reschedule",
-        booking_draft=draft,
-        reschedule_request=None,
-    )
-    session_state["pending_action"] = pending
-    session_state["_reschedule_booking_uid"] = booking.uid
-    session_state["available_slots"] = slots[:_DISPLAY_LIMIT]
-
+    _setup_reschedule_state(session_state, booking, event_type_id, tz, slots[:_DISPLAY_LIMIT])
     return "Here are some available slots — pick one above or reply with a number."
 
 
@@ -1809,8 +2577,23 @@ def _handle_slot_selection_for_reschedule(
     if slot is None or idx is None:
         return f"Please reply with a number between 1 and {len(slots)} to select a slot."
 
-    booking_uid = session_state.get("_reschedule_booking_uid", "")
+    # Overlap guard: reject if selected slot overlaps the original booking window
     pending = session_state.get("pending_action")
+    src = getattr(pending, "reschedule_source_booking", None) if pending else None
+    if src is not None:
+        if _slot_overlaps_booking(slot, src):
+            return "That overlaps with the original booking. Please select a different slot."
+    else:
+        orig_s = session_state.get("_reschedule_original_booking_start")
+        orig_e = session_state.get("_reschedule_original_booking_end")
+        if orig_s is not None and orig_e is not None:
+            orig_s_utc = orig_s.astimezone(timezone.utc)
+            orig_e_utc = orig_e.astimezone(timezone.utc)
+            if (slot.start.astimezone(timezone.utc) < orig_e_utc
+                    and slot.end.astimezone(timezone.utc) > orig_s_utc):
+                return "That overlaps with the original booking. Please select a different slot."
+
+    booking_uid = session_state.get("_reschedule_booking_uid", "")
     if pending is None:
         pending = PendingAction(action_type="reschedule")
 
@@ -1821,11 +2604,13 @@ def _handle_slot_selection_for_reschedule(
     session_state["pending_action"] = pending
     session_state["available_slots"] = []
 
-    slot_line = _format_slot_option(idx, slot)
-    return (
-        f"You selected:\n  {slot_line}\n"
-        f"Reschedule to this time?"
-    )
+    orig_title = src.title if src else session_state.get("_reschedule_original_booking_title")
+    orig_start = src.start if src else session_state.get("_reschedule_original_booking_start")
+    new_dt = f"{_format_display_dt(slot.start)} {_format_display_tz(slot.start)}"
+    if orig_title and orig_start:
+        orig_dt = f"{_format_display_dt(orig_start)} {_format_display_tz(orig_start)}"
+        return f"Move '{orig_title}' from {orig_dt} to {new_dt}?"
+    return f"Reschedule to {new_dt}?"
 
 
 # ---------------------------------------------------------------------------
@@ -1839,13 +2624,22 @@ def _handle_match_selection(
     selected = _pick_booking_by_text(user_text, pending.matching_bookings)
     if selected is None:
         return (
-            _multiple_matches_text(pending.matching_bookings, pending.action_type)
+            _multiple_matches_text(
+                pending.matching_bookings,
+                pending.action_type,
+                partial=pending.matching_bookings_are_partial,
+            )
             + "\n\nPlease reply with a number."
         )
     pending.matching_bookings = []
     session_state["pending_action"] = pending
     if pending.action_type == "cancel":
-        pending.cancel_request = CancelRequest(booking_uid=selected.uid)
+        pending.cancel_request = CancelRequest(
+            booking_uid=selected.uid,
+            booking_title=selected.title,
+            booking_start=selected.start,
+            booking_end=selected.end,
+        )
         return _cancel_confirmation_text(selected)
     effective_intent = session_state.pop("_reschedule_original_intent", None) \
         or UserIntent(intent_type=IntentType.reschedule)
@@ -1862,29 +2656,118 @@ def _pick_booking_by_text(user_text: str, bookings: list[Booking]) -> Optional[B
     return None
 
 
+def _check_past_booking(intent: UserIntent, cal_client: CalClient) -> bool:
+    """Return True if the intent matches a past (non-upcoming) booking. Read-only."""
+    time_window = _intent_time_window(intent, prefer_source=True)
+    if time_window is None:
+        return False
+    try:
+        all_bookings = cal_client.list_bookings(
+            start=time_window[0], end=time_window[1], status=None
+        )
+    except CalClientError:
+        return False
+    past_statuses = frozenset({"accepted", "completed", "tentative"})
+    candidates = [
+        b for b in all_bookings
+        if (b.status or "").strip().lower() in past_statuses
+    ]
+    matched, _ = _tiered_match_bookings(candidates, intent)
+    return bool(matched)
+
+
+def _attendee_matches_booking(attendee: ExtractedAttendee, b: Booking) -> bool:
+    """Return True if the extracted attendee appears in booking attendees or title."""
+    title_lower = b.title.lower()
+    booking_attendee_names = [a.name.lower() for a in b.attendees]
+    booking_attendee_emails = [a.email.lower() for a in b.attendees]
+
+    name = (attendee.name or "").lower().strip()
+    email = (attendee.email or "").lower().strip()
+
+    if name:
+        if name in title_lower:
+            return True
+        if any(name in bn for bn in booking_attendee_names):
+            return True
+    if email:
+        if any(email in be for be in booking_attendee_emails):
+            return True
+    return False
+
+
+def _event_name_matches_booking(event_name: str, b: Booking) -> bool:
+    """Return True if every event_name token appears in the booking title (title-only)."""
+    tokens = _normalize_booking_tokens(event_name)
+    if not tokens:
+        return False
+    title_lower = b.title.lower()
+    return all(t in title_lower for t in tokens)
+
+
 def _filter_bookings(bookings: list[Booking], intent: UserIntent) -> list[Booking]:
     time_window = _intent_time_window(intent, prefer_source=True)
     tokens = _normalize_booking_tokens(intent.search_text)
-    name = (intent.attendee_name or "").lower()
-    email = (intent.attendee_email or "").lower()
+    event_name = (intent.event_name or "").strip()
+    event_name_tokens = _normalize_booking_tokens(event_name) if event_name else []
+
+    # Use multi-attendee list when available; drop blank entries; fall back to scalar fields.
+    effective_attendees = [
+        a for a in intent.attendees
+        if (a.name or "").strip() or (a.email or "").strip()
+    ]
+    use_multi_attendees = bool(effective_attendees)
+    single_name = (intent.attendee_name or "").lower() if not use_multi_attendees else ""
+    single_email = (intent.attendee_email or "").lower() if not use_multi_attendees else ""
+
+    # Compute text_filters_present once — it is based on intent, not individual bookings.
+    text_filters_present = bool(
+        use_multi_attendees
+        or (not use_multi_attendees and (single_name or single_email))
+        or event_name_tokens
+        or tokens
+    )
 
     results: list[Booking] = []
     for b in bookings:
         if intent.booking_uid and b.uid == intent.booking_uid:
             results.append(b)
             continue
+
         time_match = time_window is not None and _booking_overlaps_window(
             b, time_window[0], time_window[1]
         )
+
+        # Text matching: multi-attendee (AND across attendees), event_name (title-only), search_text
+        if use_multi_attendees:
+            # All extracted attendees must be found somewhere in the booking.
+            multi_attendee_match = all(
+                _attendee_matches_booking(a, b) for a in effective_attendees
+            )
+        else:
+            multi_attendee_match = False
+
+        # event_name: title-only match (only when non-generic tokens exist)
+        event_name_match = bool(event_name_tokens) and _event_name_matches_booking(event_name, b)
+
+        # search_text: existing token matching across title + attendees
         token_match = _tokens_match_booking(tokens, b)
-        attendee_name_match = name and any(
-            name in a.name.lower() for a in b.attendees
+
+        # Legacy scalar attendee matching (backward compat when attendees list is empty)
+        single_name_match = bool(single_name and any(
+            single_name in a.name.lower() for a in b.attendees
+        ))
+        single_email_match = bool(single_email and any(
+            single_email in a.email.lower() for a in b.attendees
+        ))
+
+        text_match = bool(
+            (use_multi_attendees and multi_attendee_match)
+            or (not use_multi_attendees and (single_name_match or single_email_match))
+            or event_name_match
+            or token_match
         )
-        attendee_email_match = email and any(
-            email in a.email.lower() for a in b.attendees
-        )
-        text_filters_present = bool(tokens or name or email)
-        text_match = bool(token_match or attendee_name_match or attendee_email_match)
+
         if time_window is not None and text_filters_present:
             if time_match and text_match:
                 results.append(b)
@@ -1897,13 +2780,7 @@ def _filter_bookings(bookings: list[Booking], intent: UserIntent) -> list[Bookin
             results.append(b)
 
     # If no filters provided, return all
-    if (
-        not tokens
-        and not name
-        and not email
-        and not intent.booking_uid
-        and time_window is None
-    ):
+    if not text_filters_present and not intent.booking_uid and time_window is None:
         return bookings
     return results
 
@@ -1913,8 +2790,12 @@ def _intent_time_window(
     *,
     prefer_source: bool = False,
 ) -> Optional[tuple[datetime, datetime]]:
-    start = intent.source_start_time if prefer_source and intent.source_start_time is not None else intent.start_time
-    end = intent.source_end_time if prefer_source and intent.source_end_time is not None else intent.end_time
+    if prefer_source:
+        start = intent.source_start_time
+        end = intent.source_end_time
+    else:
+        start = intent.start_time
+        end = intent.end_time
     if start is None and end is None:
         return None
     if start is None or end is None:
@@ -1976,6 +2857,130 @@ def _tokens_match_booking(tokens: list[str], b: "Booking") -> bool:
     return True
 
 
+def _tokens_match_title_only(tokens: list[str], b: "Booking") -> bool:
+    """Return True if every token appears in the booking title only (not attendees)."""
+    if not tokens:
+        return False
+    title_lower = b.title.lower()
+    return all(t in title_lower for t in tokens)
+
+
+def _any_token_matches_booking(tokens: list[str], b: "Booking") -> bool:
+    """Return True if at least one token appears in title, attendee name, or attendee email."""
+    if not tokens:
+        return False
+    title_lower = b.title.lower()
+    names = [a.name.lower() for a in b.attendees]
+    emails = [a.email.lower() for a in b.attendees]
+    return any(
+        t in title_lower
+        or any(t in n for n in names)
+        or any(t in e for e in emails)
+        for t in tokens
+    )
+
+
+def _tiered_match_bookings(
+    bookings: list[Booking], intent: UserIntent
+) -> tuple[list[Booking], bool]:
+    """Return (candidates, is_loose) for cancel/reschedule operations.
+
+    Candidates are bookings from the highest non-empty tier.
+    is_loose=True when Tier 4 or the vague-request fallback fires.
+    """
+    # Step 1: UID hard filter
+    if intent.booking_uid:
+        uid_match = next((b for b in bookings if b.uid == intent.booking_uid), None)
+        if uid_match is not None:
+            return ([uid_match], False)
+        return ([], False)
+
+    # Step 2: Time window hard filter
+    time_window = _intent_time_window(intent, prefer_source=True)
+    if time_window is not None:
+        pool = [b for b in bookings if _booking_overlaps_window(b, time_window[0], time_window[1])]
+    else:
+        pool = list(bookings)
+
+    # Step 3: Criteria detection
+    effective_attendees = [
+        a for a in intent.attendees
+        if (a.name or "").strip() or (a.email or "").strip()
+    ]
+    use_multi_attendees = bool(effective_attendees)
+    single_name = (intent.attendee_name or "").lower() if not use_multi_attendees else ""
+    single_email = (intent.attendee_email or "").lower() if not use_multi_attendees else ""
+    has_attendee = bool(
+        use_multi_attendees
+        or (not use_multi_attendees and (single_name or single_email))
+    )
+    event_name_tokens = _normalize_booking_tokens(intent.event_name) if intent.event_name else []
+    has_event_name = bool(event_name_tokens)
+    search_tokens = _normalize_booking_tokens(intent.search_text)
+    has_search_text = bool(search_tokens)
+    has_any_text_criteria = has_attendee or has_event_name or has_search_text
+
+    # Step 4: Per-booking match helpers
+    def _am(b: Booking) -> bool:
+        if use_multi_attendees:
+            return all(_attendee_matches_booking(a, b) for a in effective_attendees)
+        title_lower = b.title.lower()
+        att_names = [a.name.lower() for a in b.attendees]
+        att_emails = [a.email.lower() for a in b.attendees]
+        if single_name and (
+            single_name in title_lower or any(single_name in n for n in att_names)
+        ):
+            return True
+        if single_email and any(single_email in e for e in att_emails):
+            return True
+        return False
+
+    def _tm(b: Booking) -> bool:
+        result = False
+        if has_event_name:
+            result = result or _event_name_matches_booking(intent.event_name, b)
+        if has_search_text:
+            if has_attendee:
+                result = result or _tokens_match_title_only(search_tokens, b)
+            else:
+                result = result or _tokens_match_booking(search_tokens, b)
+        return result
+
+    # Step 5: Tier assignment
+    tier1: list[Booking] = []
+    tier2: list[Booking] = []
+    tier3: list[Booking] = []
+    tier4: list[Booking] = []
+
+    for b in pool:
+        am = has_attendee and _am(b)
+        tm = (has_event_name or has_search_text) and _tm(b)
+        if has_attendee and (has_event_name or has_search_text) and am and tm:
+            tier1.append(b)
+        elif has_attendee and am:
+            tier2.append(b)
+        elif (has_event_name or has_search_text) and tm:
+            tier3.append(b)
+        elif has_search_text and _any_token_matches_booking(search_tokens, b):
+            tier4.append(b)
+
+    # Step 6: Return highest non-empty tier
+    if tier1:
+        return (tier1, False)
+    if tier2:
+        return (tier2, False)
+    if tier3:
+        return (tier3, False)
+    if tier4:
+        return (tier4, True)
+
+    # Step 7: Vague fallback — no effective text criteria at all
+    if not has_any_text_criteria:
+        return (pool, True)
+
+    return ([], False)
+
+
 def _preserve_draft_time_in_intent(new_intent: UserIntent, prior_start: datetime) -> None:
     """Copy hour/minute from prior_start onto new_intent.start_time (keeping the new date).
 
@@ -2015,6 +3020,8 @@ def _merge_intent_into_draft(draft: BookingDraft, intent: UserIntent) -> None:
         draft.time_preference = intent.time_preference
     if intent.relative_time_qualifier is not None:
         draft.relative_time_qualifier = intent.relative_time_qualifier
+    if intent.time_granularity is not None:
+        draft.time_granularity = intent.time_granularity
 
 
 # ---------------------------------------------------------------------------
@@ -2071,8 +3078,13 @@ def _cancel_confirmation_text(booking: Booking) -> str:
     ).strip()
 
 
-def _multiple_matches_text(bookings: list[Booking], action: str) -> str:
-    lines = [f"I found {len(bookings)} matching bookings. Which one do you mean?"]
+def _multiple_matches_text(bookings: list[Booking], action: str, partial: bool = False) -> str:
+    count = len(bookings)
+    if partial:
+        header = f"I found {count} possible match{'es' if count != 1 else ''}. Which did you mean?"
+    else:
+        header = f"I found {count} matching bookings. Which one do you mean?"
+    lines = [header]
     for i, b in enumerate(bookings, 1):
         lines.append(f"{i}. {b.title} — {_format_display_dt(b.start)} {_format_display_tz(b.start)}".strip())
     return "\n".join(lines)
@@ -2121,6 +3133,17 @@ def _is_negative(text: str) -> bool:
 
 def _is_cancel_word(text: str) -> bool:
     return text.strip().lower() == "cancel"
+
+
+_CANCEL_BOOKING_PHRASE_RE = re.compile(
+    r"^(?:please\s+)?cancel\s+(?:my\s+)?(?:the|this|that)\s+"
+    r"(?:booking|meeting|event|appointment|call)$",
+    re.IGNORECASE,
+)
+
+
+def _is_cancel_booking_phrase(text: str) -> bool:
+    return bool(_CANCEL_BOOKING_PHRASE_RE.match(text.strip()))
 
 
 def _is_option_selection_text(text: str, option_count: int) -> bool:
@@ -2219,6 +3242,64 @@ def _is_plain_name(text: str) -> bool:
     return True
 
 
+_SCHEDULING_COMMAND_RE = re.compile(
+    r"\b(book|schedule|cancel|reschedule|move|list|show)\b", re.IGNORECASE
+)
+_SCHEDULING_QUERY_RE = re.compile(
+    r"\bwhat(?:'s|\s+is)?\s+on\b"           # "what's on tomorrow"
+    r"|\bwhat\s+(?:do\s+i\s+have|happens?)\b"  # "what do I have", "what happens"
+    r"|\b(?:today|tomorrow|this\s+week|next\s+week|monday|tuesday|wednesday"
+    r"|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_scheduling_command(text: str) -> bool:
+    """Return True if text contains a scheduling verb, calendar phrase, or scheduling query."""
+    return bool(
+        _SCHEDULING_COMMAND_RE.search(text)
+        or _CALENDAR_PHRASES.search(text)
+        or _SCHEDULING_QUERY_RE.search(text)
+    )
+
+
 def _clear_reschedule_state(session_state: dict) -> None:
     session_state.pop("_reschedule_booking_uid", None)
     session_state.pop("_reschedule_original_intent", None)
+    session_state.pop("_reschedule_original_booking_title", None)
+    session_state.pop("_reschedule_original_booking_start", None)
+    session_state.pop("_reschedule_original_booking_end", None)
+
+
+def _slot_overlaps_booking(slot: Slot, booking: Booking) -> bool:
+    s_utc = slot.start.astimezone(timezone.utc)
+    e_utc = slot.end.astimezone(timezone.utc)
+    orig_s = booking.start.astimezone(timezone.utc)
+    orig_e = booking.end.astimezone(timezone.utc)
+    return s_utc < orig_e and e_utc > orig_s
+
+
+def _setup_reschedule_state(
+    session_state: dict,
+    booking: Booking,
+    event_type_id: int,
+    tz: str,
+    slots: list[Slot],
+) -> PendingAction:
+    draft = BookingDraft(
+        attendee_name=booking.attendees[0].name if booking.attendees else None,
+        event_type_id=event_type_id,
+        timezone=tz,
+    )
+    pending = PendingAction(
+        action_type="reschedule",
+        booking_draft=draft,
+        reschedule_source_booking=booking,
+    )
+    session_state["pending_action"] = pending
+    session_state["_reschedule_booking_uid"] = booking.uid
+    session_state["_reschedule_original_booking_title"] = booking.title
+    session_state["_reschedule_original_booking_start"] = booking.start
+    session_state["_reschedule_original_booking_end"] = booking.end
+    session_state["available_slots"] = slots
+    return pending

@@ -663,3 +663,44 @@ class TestPagination:
         with pytest.raises(CalClientError) as exc_info:
             cal_client.list_bookings()
         assert exc_info.value.reason == "pagination_limit"
+
+
+# ===========================================================================
+# TestParserSafety
+# ===========================================================================
+
+
+class TestParserSafety:
+    def test_list_event_types_malformed_entry_raises_cal_client_error(
+        self, cal_client: CalClient, mock_http: MagicMock
+    ) -> None:
+        """Pydantic ValidationError from bad event type data is wrapped as CalClientError."""
+        mock_http.get.return_value = make_response(
+            200,
+            {
+                "status": "success",
+                "data": [
+                    {
+                        "id": "not-an-int",
+                        "slug": "x",
+                        "title": "T",
+                        "lengthInMinutes": 30,
+                    }
+                ],
+            },
+        )
+        with pytest.raises(CalClientError) as exc_info:
+            cal_client.list_event_types()
+        assert exc_info.value.reason == "malformed"
+
+    def test_find_slots_non_dict_data_field_raises_cal_client_error(
+        self, cal_client: CalClient, mock_http: MagicMock
+    ) -> None:
+        """Non-dict 'data' in slots response is caught and raised as CalClientError."""
+        mock_http.get.return_value = make_response(
+            200,
+            {"status": "success", "data": ["not", "a", "dict"]},
+        )
+        with pytest.raises(CalClientError) as exc_info:
+            cal_client.find_slots(_T0, _T1)
+        assert exc_info.value.reason == "malformed"
