@@ -233,9 +233,7 @@ class TestOptimisticRendering:
 
     def test_handle_message_accepts_history_override_param(self):
         """handle_message signature accepts _history_override without crashing."""
-        from unittest.mock import patch
         from assistant import handle_message
-        from schemas import UserIntent, IntentType
         import inspect
 
         sig = inspect.signature(handle_message)

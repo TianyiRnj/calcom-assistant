@@ -95,9 +95,11 @@ class CalClient:
         self,
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
-        status: str = "upcoming",
+        status: Optional[str] = "upcoming",
     ) -> list[Booking]:
-        params: dict = {"status": status}
+        params: dict = {}
+        if status is not None:
+            params["status"] = status
         if start is not None:
             params["afterStart"] = _to_utc_iso(start)
         if end is not None:
@@ -169,7 +171,12 @@ class CalClient:
 
         def _parse(data: dict) -> list[Slot]:
             slots: list[Slot] = []
-            for day_slots in data.get("data", {}).values():
+            data_val = data.get("data", {})
+            if not isinstance(data_val, dict):
+                raise CalClientError(
+                    "Invalid slots response: 'data' is not a dict", None, reason="malformed"
+                )
+            for day_slots in data_val.values():
                 for entry in day_slots:
                     try:
                         slots.append(
@@ -267,7 +274,13 @@ class CalClient:
             raise CalClientError(str(exc), None, reason="malformed") from exc
 
     def _get(self, path: str, params: dict, version: str, parse):
-        return parse(self._get_raw(path, params, version))
+        data = self._get_raw(path, params, version)
+        try:
+            return parse(data)
+        except CalClientError:
+            raise
+        except Exception as exc:
+            raise CalClientError(str(exc), None, reason="malformed") from exc
 
     def _post(self, path: str, body: dict, version: str, parse):
         try:

@@ -9,9 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from assistant import (
-    LLM_EXTRACTION_MAX_RETRIES,
     MAX_LLM_HISTORY_MESSAGES,
-    _any_token_matches_booking,
     _contains_impossible_date,
     _date_range_from_text,
     _deterministic_cancel_with_person,
@@ -21,20 +19,19 @@ from assistant import (
     _format_display_dt,
     _format_display_tz,
     _format_slot_option,
+    _intent_time_window,
     _is_valid_email,
     _map_extracted_to_intent,
     _multiple_matches_text,
     _nearby_slot_windows,
     _no_availability_message,
     _normalize_booking_tokens,
-    _parse_and_validate_extraction,
     _parse_duration_minutes,
     _pick_slot_with_index,
     _preserve_draft_time_in_intent,
     _rank_slots_by_day_qualifier,
     _redact_potential_secrets,
     _tiered_match_bookings,
-    _tokens_match_title_only,
     _trust_check,
     extract_intent,
     handle_message,
@@ -852,16 +849,14 @@ class TestWaitingForField:
         # waiting_for_field should still be set
         assert state["pending_action"].waiting_for_field == "attendee_email"
 
-    def test_email_not_shaped_falls_through_to_llm(self) -> None:
+    def test_email_not_shaped_rejected_as_invalid(self) -> None:
+        # Non-scheduling, non-email input is now treated as an email attempt and rejected.
         state = self._state_waiting("attendee_email")
         cal = _make_cal()
-        resp = MagicMock()
-        resp.output_text = '{"intent_type": "list"}'
-        with patch("assistant._create_openai_client") as mock_client:
-            mock_client.return_value.responses.create.return_value = resp
-            cal.list_bookings.return_value = []
-            handle_message("I'll get back to you", state, cal)
-        mock_client.assert_called_once()
+        reply = handle_message("I'll get back to you", state, cal)
+        assert "email" in reply.lower()
+        # waiting_for_field should still be set — not cleared
+        assert state["pending_action"].waiting_for_field == "attendee_email"
 
     def test_explicit_calendar_query_interrupts_waiting_for_name(self) -> None:
         state = self._state_waiting("attendee_name")
@@ -1126,7 +1121,7 @@ class TestSlotOptionFormatting:
         assert "You selected" in reply
         assert "1." in reply
 
-    def test_reschedule_slot_selection_confirmation_includes_you_selected(self) -> None:
+    def test_reschedule_slot_selection_confirmation_format(self) -> None:
         from assistant import _handle_slot_selection_for_reschedule
         state = {
             "messages": [],
@@ -1136,8 +1131,9 @@ class TestSlotOptionFormatting:
         }
         slots = [Slot(start=_T0, end=_T1)]
         reply = _handle_slot_selection_for_reschedule("1", state, slots)
-        assert "You selected" in reply
-        assert "1." in reply
+        # New format: "Reschedule to <time>?" with no "You selected" preamble
+        assert "Reschedule to" in reply
+        assert "You selected" not in reply
 
 
 # ===========================================================================
@@ -1465,11 +1461,10 @@ class TestDayLevelRelativeQualifier:
 
     def test_same_day_reschedule_later_after_source(self) -> None:
         # Source booking ends at 13:00; "later" should prefer slots after 13:00
-        target_date_str = "2050-06-10"
         local_tz = ZoneInfo("America/New_York")
         source_start = datetime(2050, 6, 10, 12, 0, 0, tzinfo=local_tz)
         source_end = datetime(2050, 6, 10, 13, 0, 0, tzinfo=local_tz)
-        from schemas import Booking, Attendee
+        from schemas import Booking
         source_booking = Booking(
             uid="src-1", title="Source", start=source_start, end=source_end
         )
@@ -1486,7 +1481,6 @@ class TestDayLevelRelativeQualifier:
 
     def test_full_day_query_for_later_tomorrow(self) -> None:
         """When relative_time_qualifier is set, find_slots is called with full-day window."""
-        import os
         local_tz = ZoneInfo("America/New_York")
         tomorrow_morning = datetime(2050, 6, 10, 9, 0, 0, tzinfo=local_tz)
         afternoon_slot = _make_slot(15)
@@ -1525,7 +1519,15 @@ class TestDayLevelRelativeQualifier:
 
     def test_later_next_week_no_qualifier_set(self) -> None:
         # "later next week" should not set relative_time_qualifier (week-level)
-        resp = openai_response("book", relative_time_qualifier=None)
+        # LLM should extract target_window_start/end for "next week"
+        next_mon = "2026-06-15T00:00:00-04:00"
+        next_sun = "2026-06-22T00:00:00-04:00"
+        resp = openai_response(
+            "book",
+            relative_time_qualifier=None,
+            target_window_start=next_mon,
+            target_window_end=next_sun,
+        )
         with _mock_openai(resp):
             intent = extract_intent("book a call later next week", [])
         assert intent.relative_time_qualifier is None
@@ -2551,3 +2553,657 @@ class TestTieredMatching:
         with patch("assistant.extract_intent", return_value=intent):
             reply = handle_message("hmm which one", state, cal)
         assert "possible" in reply.lower()
+
+
+# ---------------------------------------------------------------------------
+# TestRelativeRescheduleDateMapping
+# ---------------------------------------------------------------------------
+
+
+class TestRelativeRescheduleDateMapping:
+    """Fix 7A: date_range + relative_time_qualifier → always maps to target, not source."""
+
+    _NY = ZoneInfo("America/New_York")
+
+    def _tomorrow_range(self):
+        tomorrow = datetime(2050, 9, 6, 0, 0, 0, tzinfo=self._NY)
+        day_after = datetime(2050, 9, 7, 0, 0, 0, tzinfo=self._NY)
+        return tomorrow, day_after
+
+    def test_date_range_plus_qualifier_maps_to_target(self):
+        tomorrow, day_after = self._tomorrow_range()
+        extracted = ExtractedIntent(
+            intent_type=IntentType.reschedule,
+            target_start_time=None,
+            date_range_start=tomorrow,
+            date_range_end=day_after,
+            relative_time_qualifier="later",
+            source_start_time=None,
+        )
+        result = _map_extracted_to_intent(extracted)
+        assert result.start_time == tomorrow
+        assert result.relative_time_qualifier == "later"
+        assert result.source_start_time is None
+
+    def test_date_range_plus_qualifier_preserves_source_start_time(self):
+        tomorrow, day_after = self._tomorrow_range()
+        source = datetime(2050, 9, 5, 14, 0, 0, tzinfo=self._NY)
+        extracted = ExtractedIntent(
+            intent_type=IntentType.reschedule,
+            target_start_time=None,
+            date_range_start=tomorrow,
+            date_range_end=day_after,
+            relative_time_qualifier="later",
+            source_start_time=source,
+            source_duration_minutes=30,
+        )
+        result = _map_extracted_to_intent(extracted)
+        assert result.start_time == tomorrow
+        assert result.source_start_time == source
+        assert result.relative_time_qualifier == "later"
+
+
+# ---------------------------------------------------------------------------
+# TestIntentTimeWindow
+# ---------------------------------------------------------------------------
+
+
+class TestIntentTimeWindow:
+    """Fix 4: prefer_source=True must never return target time."""
+
+    _T = datetime(2050, 9, 5, 14, 0, 0, tzinfo=timezone.utc)
+    _T_end = datetime(2050, 9, 5, 14, 30, 0, tzinfo=timezone.utc)
+
+    def test_prefer_source_with_no_source_returns_none(self):
+        intent = UserIntent(
+            intent_type=IntentType.reschedule,
+            start_time=self._T,
+            end_time=self._T_end,
+            source_start_time=None,
+        )
+        result = _intent_time_window(intent, prefer_source=True)
+        assert result is None
+
+    def test_prefer_source_with_source_returns_source_window(self):
+        intent = UserIntent(
+            intent_type=IntentType.cancel,
+            source_start_time=self._T,
+            source_end_time=self._T_end,
+            start_time=None,
+        )
+        result = _intent_time_window(intent, prefer_source=True)
+        assert result is not None
+        assert result[0] == self._T
+        assert result[1] == self._T_end
+
+    def test_prefer_source_false_returns_target_window(self):
+        intent = UserIntent(
+            intent_type=IntentType.book,
+            start_time=self._T,
+            end_time=self._T_end,
+        )
+        result = _intent_time_window(intent, prefer_source=False)
+        assert result is not None
+        assert result[0] == self._T
+
+
+# ---------------------------------------------------------------------------
+# TestBlankAttendeeFilter
+# ---------------------------------------------------------------------------
+
+
+class TestBlankAttendeeFilter:
+    """Fix 6: blank ExtractedAttendee objects must be dropped before matching."""
+
+    _T0 = datetime(2050, 9, 5, 14, 0, 0, tzinfo=timezone.utc)
+    _T1 = datetime(2050, 9, 5, 14, 30, 0, tzinfo=timezone.utc)
+
+    def _booking(self):
+        return Booking(
+            uid="uid-1",
+            title="Intro Call",
+            start=self._T0,
+            end=self._T1,
+            attendees=[Attendee(name="Jane", email="jane@example.com")],
+            status="accepted",
+            event_type_id=42,
+        )
+
+    def test_map_extracted_to_intent_drops_blank_attendees(self):
+        extracted = ExtractedIntent(
+            intent_type=IntentType.book,
+            attendees=[ExtractedAttendee()],
+        )
+        result = _map_extracted_to_intent(extracted)
+        assert result.attendees == []
+        assert result.attendee_name is None
+        assert result.attendee_email is None
+
+    def test_tiered_match_not_blocked_by_blank_attendees(self):
+        booking = self._booking()
+        intent = UserIntent(
+            intent_type=IntentType.cancel,
+            attendees=[ExtractedAttendee()],
+            source_start_time=self._T0,
+            source_end_time=self._T1,
+        )
+        candidates, _ = _tiered_match_bookings([booking], intent)
+        assert booking in candidates
+
+
+# ---------------------------------------------------------------------------
+# TestGenericEventNameTokens (unit-level)
+# ---------------------------------------------------------------------------
+
+
+class TestGenericEventNameTokens:
+    """Fix 3: generic event_name tokens normalize to [] and must not block fallback."""
+
+    def test_meeting_normalizes_to_empty(self):
+        assert _normalize_booking_tokens("meeting") == []
+
+    def test_call_normalizes_to_empty(self):
+        assert _normalize_booking_tokens("call") == []
+
+    def test_event_normalizes_to_empty(self):
+        assert _normalize_booking_tokens("event") == []
+
+    def test_intro_is_non_generic(self):
+        tokens = _normalize_booking_tokens("Intro")
+        assert "intro" in tokens
+
+
+# ===========================================================================
+# TestNormalizeUserText
+# ===========================================================================
+
+
+class TestNormalizeUserText:
+    """Tests for _normalize_user_text: ordinal stripping and punctuation cleanup."""
+
+    def test_ordinal_stripped_from_date(self):
+        from assistant import _normalize_user_text
+        assert _normalize_user_text("june 15th") == "june 15"
+
+    def test_ordinal_1st_stripped(self):
+        from assistant import _normalize_user_text
+        assert _normalize_user_text("the 1st") == "the 1"
+
+    def test_time_marker_preserved(self):
+        from assistant import _normalize_user_text
+        result = _normalize_user_text("3pm!")
+        assert "3pm" in result
+        assert "!" not in result
+
+    def test_trailing_question_mark_stripped(self):
+        from assistant import _normalize_user_text
+        result = _normalize_user_text("cancel my meeting?")
+        assert result == "cancel my meeting"
+
+    def test_comma_preserved(self):
+        from assistant import _normalize_user_text
+        result = _normalize_user_text("book a call, June 15")
+        assert "," in result
+
+
+# ===========================================================================
+# TestWindowFieldMapping
+# ===========================================================================
+
+_NY = ZoneInfo("America/New_York")
+_FRI = datetime(2050, 9, 6, 0, 0, 0, tzinfo=_NY)  # a Friday at midnight
+_SAT = datetime(2050, 9, 7, 0, 0, 0, tzinfo=_NY)
+_JUN12 = datetime(2050, 6, 12, 0, 0, 0, tzinfo=_NY)
+_JUN13 = datetime(2050, 6, 13, 0, 0, 0, tzinfo=_NY)
+_JUN15 = datetime(2050, 6, 15, 0, 0, 0, tzinfo=_NY)
+_JUN16 = datetime(2050, 6, 16, 0, 0, 0, tzinfo=_NY)
+_NEXT_MON = datetime(2050, 9, 8, 0, 0, 0, tzinfo=_NY)
+_NEXT_SUN_END = datetime(2050, 9, 15, 0, 0, 0, tzinfo=_NY)
+
+
+class TestWindowFieldMapping:
+    """Tests for source_window and target_window fields in _map_extracted_to_intent."""
+
+    def test_cancel_with_source_window_maps_to_source_start_end(self):
+        extracted = ExtractedIntent(
+            intent_type=IntentType.cancel,
+            source_window_start=_FRI,
+            source_window_end=_SAT,
+        )
+        result = _map_extracted_to_intent(extracted)
+        assert result.source_start_time == _FRI
+        assert result.source_end_time == _SAT
+        assert result.start_time is None
+        assert result.end_time is None
+
+    def test_cancel_source_window_beats_date_range(self):
+        extracted = ExtractedIntent(
+            intent_type=IntentType.cancel,
+            source_window_start=_FRI,
+            source_window_end=_SAT,
+            date_range_start=_JUN12,
+            date_range_end=_JUN13,
+        )
+        result = _map_extracted_to_intent(extracted)
+        assert result.source_start_time == _FRI
+
+    def test_reschedule_source_window_plus_target_window(self):
+        extracted = ExtractedIntent(
+            intent_type=IntentType.reschedule,
+            source_window_start=_JUN12,
+            source_window_end=_JUN13,
+            target_window_start=_JUN15,
+            target_window_end=_JUN16,
+        )
+        result = _map_extracted_to_intent(extracted)
+        assert result.source_start_time == _JUN12
+        assert result.source_end_time == _JUN13
+        assert result.start_time == _JUN15
+        assert result.end_time == _JUN16
+
+    def test_book_with_target_window_maps_to_start_end(self):
+        extracted = ExtractedIntent(
+            intent_type=IntentType.book,
+            target_window_start=_NEXT_MON,
+            target_window_end=_NEXT_SUN_END,
+        )
+        result = _map_extracted_to_intent(extracted)
+        assert result.start_time == _NEXT_MON
+        assert result.end_time == _NEXT_SUN_END
+        assert result.time_granularity == "date"
+
+    def test_exact_target_beats_window_for_book(self):
+        exact = datetime(2050, 9, 8, 14, 0, 0, tzinfo=_NY)
+        extracted = ExtractedIntent(
+            intent_type=IntentType.book,
+            target_start_time=exact,
+            target_window_start=_NEXT_MON,
+            target_window_end=_NEXT_SUN_END,
+        )
+        result = _map_extracted_to_intent(extracted)
+        assert result.start_time == exact
+        assert result.time_granularity == "exact"
+
+    def test_cancel_granularity_is_date_when_only_window_given(self):
+        extracted = ExtractedIntent(
+            intent_type=IntentType.cancel,
+            source_window_start=_FRI,
+            source_window_end=_SAT,
+        )
+        result = _map_extracted_to_intent(extracted)
+        assert result.time_granularity == "date"
+
+    def test_cancel_granularity_is_exact_when_source_start_time_given(self):
+        exact = datetime(2050, 9, 6, 15, 0, 0, tzinfo=_NY)
+        extracted = ExtractedIntent(
+            intent_type=IntentType.cancel,
+            source_start_time=exact,
+            source_duration_minutes=30,
+        )
+        result = _map_extracted_to_intent(extracted)
+        assert result.time_granularity == "exact"
+
+
+# ===========================================================================
+# TestWindowFieldValidation
+# ===========================================================================
+
+
+class TestWindowFieldValidation:
+    """ExtractedIntent pydantic validation for window field pairs."""
+
+    def test_source_window_start_without_end_raises(self):
+        with pytest.raises(Exception):
+            ExtractedIntent(
+                intent_type=IntentType.cancel,
+                source_window_start=_FRI,
+                # missing source_window_end
+            )
+
+    def test_target_window_end_without_start_raises(self):
+        with pytest.raises(Exception):
+            ExtractedIntent(
+                intent_type=IntentType.book,
+                target_window_end=_SAT,
+                # missing target_window_start
+            )
+
+    def test_source_window_end_before_start_raises(self):
+        with pytest.raises(Exception):
+            ExtractedIntent(
+                intent_type=IntentType.cancel,
+                source_window_start=_SAT,
+                source_window_end=_FRI,  # end before start
+            )
+
+    def test_valid_source_window_pair_accepted(self):
+        e = ExtractedIntent(
+            intent_type=IntentType.cancel,
+            source_window_start=_FRI,
+            source_window_end=_SAT,
+        )
+        assert e.source_window_start == _FRI
+
+
+# ===========================================================================
+# TestHandleBookWindowBehavior
+# ===========================================================================
+
+
+class TestHandleBookWindowBehavior:
+    """Tests for multi-day window and date+time combine logic in _handle_book."""
+
+    _NY = ZoneInfo("America/New_York")
+
+    def _make_cal(self):
+        cal = MagicMock(spec=CalClient)
+        cal.list_event_types.return_value = [
+            EventType(id=42, title="Meeting", slug="meeting", length_minutes=30)
+        ]
+        cal.find_slots.return_value = []
+        return cal
+
+    def test_multi_day_window_asks_for_specific_day(self):
+        from assistant import _handle_book
+        monday = datetime(2050, 9, 8, 0, 0, 0, tzinfo=self._NY)
+        sunday = datetime(2050, 9, 15, 0, 0, 0, tzinfo=self._NY)
+        intent = UserIntent(
+            intent_type=IntentType.book,
+            attendee_name="Jane",
+            attendee_email="jane@example.com",
+            start_time=monday,
+            end_time=sunday,
+            time_granularity="date",
+        )
+        state: dict = {"pending_action": None, "available_slots": []}
+        reply = _handle_book(intent, state, self._make_cal())
+        assert "which day" in reply.lower() or "specific day" in reply.lower()
+
+    def test_single_day_window_proceeds_to_slot_fetch(self):
+        from assistant import _handle_book
+        tuesday = datetime(2050, 9, 9, 0, 0, 0, tzinfo=self._NY)
+        wednesday = datetime(2050, 9, 10, 0, 0, 0, tzinfo=self._NY)
+        intent = UserIntent(
+            intent_type=IntentType.book,
+            attendee_name="Jane",
+            attendee_email="jane@example.com",
+            start_time=tuesday,
+            end_time=wednesday,
+            time_granularity="date",
+        )
+        cal = self._make_cal()
+        state: dict = {"pending_action": None, "available_slots": []}
+        _handle_book(intent, state, cal)
+        # Should have called find_slots (not just asked for a day)
+        assert cal.find_slots.called
+
+    def test_date_plus_time_combine_uses_draft_date(self):
+        from assistant import _handle_book
+        local_tz = self._NY
+        jun15 = datetime(2050, 6, 15, 0, 0, 0, tzinfo=local_tz)
+        jun16 = datetime(2050, 6, 16, 0, 0, 0, tzinfo=local_tz)
+        # First turn: store date-only draft
+        first_intent = UserIntent(
+            intent_type=IntentType.book,
+            attendee_name="Jane",
+            attendee_email="jane@example.com",
+            start_time=jun15,
+            end_time=jun16,
+            time_granularity="date",
+        )
+        cal = self._make_cal()
+        state: dict = {"pending_action": None, "available_slots": []}
+        _handle_book(first_intent, state, cal)
+
+        # Second turn: user follows up with "2pm" — LLM resolves to today_2pm, not june 15
+        today_2pm = datetime.now(local_tz).replace(hour=14, minute=0, second=0, microsecond=0)
+        second_intent = UserIntent(
+            intent_type=IntentType.book,
+            attendee_name=None,
+            attendee_email=None,
+            start_time=today_2pm,
+            time_granularity="exact",
+        )
+        _handle_book(second_intent, state, cal)
+        # After combine, draft.start_time should be June 15 at 14:00 (not today at 14:00)
+        draft = state["pending_action"].booking_draft
+        assert draft.start_time is not None
+        draft_local = draft.start_time.astimezone(local_tz)
+        assert draft_local.month == 6
+        assert draft_local.day == 15
+        assert draft_local.hour == 14
+        assert draft.time_granularity == "exact"
+
+    def test_context_aware_time_prompt_for_date_only_draft(self):
+        from assistant import _handle_book
+        local_tz = self._NY
+        jun15 = datetime(2050, 6, 15, 0, 0, 0, tzinfo=local_tz)
+        jun16 = datetime(2050, 6, 16, 0, 0, 0, tzinfo=local_tz)
+        intent = UserIntent(
+            intent_type=IntentType.book,
+            attendee_name="Jane",
+            attendee_email="jane@example.com",
+            start_time=jun15,
+            end_time=jun16,
+            time_granularity="date",
+        )
+        state: dict = {"pending_action": None, "available_slots": []}
+        cal = self._make_cal()
+        # Slots returned so it doesn't ask for name/email but gets stuck on "which time"
+        # Force slot fetch by giving single-day window — but no slots means we ask for another time
+        # Actually with 0 slots, it should show a no-availability message and NOT ask "What time?"
+        # Let's verify the "What time on Jun 15 works?" prompt when slots are empty → no-availability
+        # Instead, call the draft directly to check the time-ask path
+        from schemas import BookingDraft, PendingAction
+        draft = BookingDraft(
+            attendee_name="Jane",
+            attendee_email="jane@example.com",
+            start_time=jun15,
+            end_time=jun16,
+            time_granularity="date",
+            timezone="America/New_York",
+        )
+        pending = PendingAction(action_type="book", booking_draft=draft)
+        state["pending_action"] = pending
+        # Now clear start_time to trigger the time-ask branch
+        draft.start_time = None
+        draft.end_time = None
+        from assistant import _ask_for_field
+        # Call _handle_book with a no-time intent; should produce "Which day" or "What time"
+        no_time_intent = UserIntent(
+            intent_type=IntentType.book,
+            attendee_name=None,
+            attendee_email=None,
+        )
+        reply = _handle_book(no_time_intent, state, cal)
+        # Should ask for day/time
+        assert "time" in reply.lower() or "day" in reply.lower()
+
+
+# ===========================================================================
+# TestCancelUidRecheckBehavior
+# ===========================================================================
+
+
+class TestCancelUidRecheckBehavior:
+    """Tests for the cancel UID re-check in _execute_confirmed_action."""
+
+    def _make_booking(self, uid: str = "uid-123", status: str = "accepted") -> Booking:
+        return Booking(
+            uid=uid,
+            title="Test Meeting",
+            start=datetime(2050, 9, 10, 14, 0, 0, tzinfo=timezone.utc),
+            end=datetime(2050, 9, 10, 14, 30, 0, tzinfo=timezone.utc),
+            status=status,
+        )
+
+    def test_cancel_proceeds_when_uid_found_as_upcoming(self):
+        from assistant import _execute_confirmed_action
+        cal = MagicMock(spec=CalClient)
+        cal.list_bookings.return_value = [self._make_booking(uid="uid-123")]
+        pending = PendingAction(
+            action_type="cancel",
+            cancel_request=CancelRequest(booking_uid="uid-123"),
+        )
+        state: dict = {"pending_action": pending, "available_slots": []}
+        _execute_confirmed_action(pending, state, cal)
+        cal.cancel_booking.assert_called_once_with("uid-123")
+
+    def test_cancel_aborted_when_uid_not_found(self):
+        from assistant import _execute_confirmed_action
+        cal = MagicMock(spec=CalClient)
+        cal.list_bookings.return_value = []  # not found
+        pending = PendingAction(
+            action_type="cancel",
+            cancel_request=CancelRequest(booking_uid="uid-123"),
+        )
+        state: dict = {"pending_action": pending, "available_slots": []}
+        reply = _execute_confirmed_action(pending, state, cal)
+        cal.cancel_booking.assert_not_called()
+        assert "already cancelled" in reply.lower() or "no longer" in reply.lower()
+
+    def test_cancel_aborted_when_status_is_cancelled(self):
+        from assistant import _execute_confirmed_action
+        cal = MagicMock(spec=CalClient)
+        cal.list_bookings.return_value = [self._make_booking(uid="uid-123", status="cancelled")]
+        pending = PendingAction(
+            action_type="cancel",
+            cancel_request=CancelRequest(booking_uid="uid-123"),
+        )
+        state: dict = {"pending_action": pending, "available_slots": []}
+        reply = _execute_confirmed_action(pending, state, cal)
+        cal.cancel_booking.assert_not_called()
+        assert "already cancelled" in reply.lower() or "no longer" in reply.lower()
+
+    def test_cancel_safe_error_on_list_failure(self):
+        from assistant import _execute_confirmed_action
+        cal = MagicMock(spec=CalClient)
+        cal.list_bookings.side_effect = CalClientError("timeout", None, reason="timeout")
+        pending = PendingAction(
+            action_type="cancel",
+            cancel_request=CancelRequest(booking_uid="uid-123"),
+        )
+        state: dict = {"pending_action": pending, "available_slots": []}
+        reply = _execute_confirmed_action(pending, state, cal)
+        cal.cancel_booking.assert_not_called()
+        assert state["pending_action"] is None
+        assert "try again" in reply.lower() or "could not verify" in reply.lower()
+
+    def test_cancel_uses_time_window_when_booking_context_provided(self):
+        from assistant import _execute_confirmed_action
+        b_start = datetime(2050, 9, 10, 14, 0, 0, tzinfo=timezone.utc)
+        b_end = datetime(2050, 9, 10, 14, 30, 0, tzinfo=timezone.utc)
+        cal = MagicMock(spec=CalClient)
+        cal.list_bookings.return_value = [self._make_booking(uid="uid-123")]
+        pending = PendingAction(
+            action_type="cancel",
+            cancel_request=CancelRequest(
+                booking_uid="uid-123",
+                booking_start=b_start,
+                booking_end=b_end,
+            ),
+        )
+        state: dict = {"pending_action": pending, "available_slots": []}
+        _execute_confirmed_action(pending, state, cal)
+        # Should have called list_bookings with status=None and time bounds
+        call_kwargs = cal.list_bookings.call_args.kwargs
+        assert call_kwargs.get("status") is None
+        assert call_kwargs.get("start") is not None
+
+
+# ===========================================================================
+# TestRescheduleConfirmationFormat
+# ===========================================================================
+
+
+class TestRescheduleConfirmationFormat:
+    """Tests for the new reschedule confirmation text: 'Move ... from ... to ...'."""
+
+    def test_confirmation_uses_move_format(self):
+        from assistant import _handle_slot_selection_for_reschedule
+        from schemas import Booking, Slot, PendingAction
+        b_start = datetime(2050, 6, 12, 10, 0, 0, tzinfo=timezone.utc)
+        b_end = datetime(2050, 6, 12, 10, 30, 0, tzinfo=timezone.utc)
+        src = Booking(uid="uid-1", title="Intro Call", start=b_start, end=b_end)
+        slot_start = datetime(2050, 6, 15, 9, 0, 0, tzinfo=timezone.utc)
+        slot_end = datetime(2050, 6, 15, 9, 30, 0, tzinfo=timezone.utc)
+        slot = Slot(start=slot_start, end=slot_end)
+        pending = PendingAction(action_type="reschedule", reschedule_source_booking=src)
+        state = {
+            "pending_action": pending,
+            "available_slots": [],
+            "_reschedule_booking_uid": "uid-1",
+        }
+        reply = _handle_slot_selection_for_reschedule("1", state, [slot])
+        assert reply.startswith("Move 'Intro Call'")
+        assert "You selected" not in reply
+        assert "?" in reply
+
+    def test_confirmation_fallback_without_source(self):
+        from assistant import _handle_slot_selection_for_reschedule
+        slot_start = datetime(2050, 6, 15, 9, 0, 0, tzinfo=timezone.utc)
+        slot_end = datetime(2050, 6, 15, 9, 30, 0, tzinfo=timezone.utc)
+        slot = Slot(start=slot_start, end=slot_end)
+        state = {
+            "pending_action": PendingAction(action_type="reschedule"),
+            "available_slots": [],
+            "_reschedule_booking_uid": "uid-1",
+        }
+        reply = _handle_slot_selection_for_reschedule("1", state, [slot])
+        assert "Reschedule to" in reply
+        assert "?" in reply
+
+
+# ===========================================================================
+# TestTrustCheckWindowRules
+# ===========================================================================
+
+
+class TestTrustCheckWindowRules:
+    """Tests for trust_check Rules 3, 4, 5 with new window fields."""
+
+    _NY = ZoneInfo("America/New_York")
+    _FRI = datetime(2050, 9, 6, 0, 0, 0, tzinfo=_NY)
+    _SAT = datetime(2050, 9, 7, 0, 0, 0, tzinfo=_NY)
+    _MON = datetime(2050, 9, 8, 0, 0, 0, tzinfo=_NY)
+    _SUN = datetime(2050, 9, 15, 0, 0, 0, tzinfo=_NY)
+
+    def test_rule3_cancel_with_source_window_is_trusted(self):
+        extracted = ExtractedIntent(
+            intent_type=IntentType.cancel,
+            source_window_start=self._FRI,
+            source_window_end=self._SAT,
+        )
+        trusted, reason = _trust_check(extracted, "cancel meeting on friday")
+        assert trusted, reason
+
+    def test_rule3_cancel_with_no_source_and_no_window_fails(self):
+        extracted = ExtractedIntent(intent_type=IntentType.cancel)
+        trusted, _ = _trust_check(extracted, "cancel meeting on friday")
+        assert not trusted
+
+    def test_rule4_book_with_target_window_is_trusted(self):
+        extracted = ExtractedIntent(
+            intent_type=IntentType.book,
+            target_window_start=self._MON,
+            target_window_end=self._SUN,
+        )
+        trusted, reason = _trust_check(extracted, "book a call next week")
+        assert trusted, reason
+
+    def test_rule4_book_with_no_target_and_no_window_fails(self):
+        extracted = ExtractedIntent(intent_type=IntentType.book)
+        trusted, _ = _trust_check(extracted, "book a call next week")
+        assert not trusted
+
+    def test_rule5_reschedule_with_explicit_time_allows_null_source(self):
+        # "Move my 3pm to later today" — has explicit time, so rule 5 should NOT fire
+        # for reschedule (Rule 3 already handles exact times differently)
+        extracted = ExtractedIntent(
+            intent_type=IntentType.reschedule,
+            relative_time_qualifier="later",
+            date_range_start=datetime(2050, 9, 5, 0, 0, 0, tzinfo=self._NY),
+            date_range_end=datetime(2050, 9, 6, 0, 0, 0, tzinfo=self._NY),
+        )
+        trusted, reason = _trust_check(extracted, "Move my 3pm to later today")
+        assert trusted, reason

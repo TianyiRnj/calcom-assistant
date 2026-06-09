@@ -47,8 +47,16 @@ class ExtractedIntent(BaseModel):
     booking_uid: Optional[str] = None
     source_start_time: Optional[datetime] = None
     source_duration_minutes: Optional[int] = None
+    # Broad search window for locating an existing event (date-only or daypart phrases).
+    # Use source_start_time for exact known times; use source_window_* for ranges like "on Friday".
+    source_window_start: Optional[datetime] = None
+    source_window_end: Optional[datetime] = None
     target_start_time: Optional[datetime] = None
     target_duration_minutes: Optional[int] = None
+    # Broad availability window for the new booking/reschedule destination.
+    # Use target_start_time for exact times; use target_window_* for "next week", "June 15", etc.
+    target_window_start: Optional[datetime] = None
+    target_window_end: Optional[datetime] = None
     date_range_start: Optional[datetime] = None
     date_range_end: Optional[datetime] = None
     relative_time_qualifier: Optional[Literal["earlier", "mid", "later"]] = None
@@ -56,7 +64,11 @@ class ExtractedIntent(BaseModel):
 
     @field_validator(
         "source_start_time",
+        "source_window_start",
+        "source_window_end",
         "target_start_time",
+        "target_window_start",
+        "target_window_end",
         "date_range_start",
         "date_range_end",
         mode="after",
@@ -72,6 +84,24 @@ class ExtractedIntent(BaseModel):
             raise ValueError(
                 "date_range_start and date_range_end must both be set or both null"
             )
+        # source_window_start and source_window_end must both be set or both null
+        if (self.source_window_start is None) != (self.source_window_end is None):
+            raise ValueError(
+                "source_window_start and source_window_end must both be set or both null"
+            )
+        if (self.source_window_start is not None
+                and self.source_window_end is not None
+                and self.source_window_end <= self.source_window_start):
+            raise ValueError("source_window_end must be after source_window_start")
+        # target_window_start and target_window_end must both be set or both null
+        if (self.target_window_start is None) != (self.target_window_end is None):
+            raise ValueError(
+                "target_window_start and target_window_end must both be set or both null"
+            )
+        if (self.target_window_start is not None
+                and self.target_window_end is not None
+                and self.target_window_end <= self.target_window_start):
+            raise ValueError("target_window_end must be after target_window_start")
         # Default source_duration_minutes to 30 when source_start_time is present
         if self.source_start_time is not None and self.source_duration_minutes is None:
             self.source_duration_minutes = 30
@@ -185,6 +215,8 @@ class BookingDraft(BaseModel):
     include_length_in_minutes: bool = False
     time_preference: Optional[str] = None
     relative_time_qualifier: Optional[Literal["earlier", "mid", "later"]] = None
+    # "date"=date-only window start (midnight), "exact"=specific clock time, "none"=no time info
+    time_granularity: Optional[Literal["none", "date", "exact"]] = None
 
     @field_validator("start_time", "end_time", mode="after")
     @classmethod
@@ -229,6 +261,14 @@ class BookingRequest(BaseModel):
 
 class CancelRequest(BaseModel):
     booking_uid: str
+    booking_title: Optional[str] = None
+    booking_start: Optional[datetime] = None
+    booking_end: Optional[datetime] = None
+
+    @field_validator("booking_start", "booking_end", mode="after")
+    @classmethod
+    def must_be_tz_aware(cls, v: datetime | None) -> datetime | None:
+        return _require_tz_aware(v)
 
 
 class RescheduleRequest(BaseModel):
@@ -253,6 +293,7 @@ class PendingAction(BaseModel):
     matching_bookings: list[Booking] = Field(default_factory=list)
     waiting_for_field: Optional[str] = None  # "attendee_name" | "attendee_email"
     matching_bookings_are_partial: bool = False  # True when candidates came from Tier 4 or vague fallback
+    reschedule_source_booking: Optional[Booking] = None  # original booking being rescheduled
 
 
 class CalClientError(Exception):
